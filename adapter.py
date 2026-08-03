@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +40,8 @@ class GuestQueryState:
     latest_content: str = ""
     delivered_content: str = ""
     delivered_finalized: bool = False
+    rich_edit_ambiguous: bool = False
+    rich_rejected_content: str = ""
     answer_attempted: bool = False
     answer_error: str | None = None
     answered: bool = False
@@ -50,11 +53,13 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
     """Thin native Guest Mode layer over Hermes' bundled Telegram adapter."""
 
     MAX_RETAINED_QUERIES = 1024
+    ANSWER_ATTEMPT_RETENTION_SECONDS = 24 * 60 * 60
     GUEST_STREAM_CONSUMER_LIMIT = 2_147_483_647
 
     def __init__(self, config):
         super().__init__(config)
         self._guest_queries: dict[str, GuestQueryState] = {}
+        self._answer_attempted_query_ids: dict[str, float] = {}
         self._guest_handler_apps: set[int] = set()
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -70,11 +75,20 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         return result
 
     def _remember_guest_query(self, chat_id: str, query_id: str) -> GuestQueryState:
+        now = time.monotonic()
+        while self._answer_attempted_query_ids:
+            retained_id = next(iter(self._answer_attempted_query_ids))
+            if self._answer_attempted_query_ids[retained_id] > now:
+                break
+            self._answer_attempted_query_ids.pop(retained_id, None)
         state = self._guest_queries.get(chat_id)
         if state is None:
             if len(self._guest_queries) >= self.MAX_RETAINED_QUERIES:
                 self._guest_queries.pop(next(iter(self._guest_queries)))
-            state = GuestQueryState(query_id=query_id)
+            state = GuestQueryState(
+                query_id=query_id,
+                answer_attempted=query_id in self._answer_attempted_query_ids,
+            )
             self._guest_queries[chat_id] = state
         return state
 
@@ -205,6 +219,50 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             self._ensure_guest_handler(self._app)
         return connected
 
+    async def _try_edit_guest_rich(
+        self,
+        state: GuestQueryState,
+        content: str,
+        query_ref: str,
+    ) -> bool:
+        """Finalize an existing Guest inline response as Bot API rich content.
+
+        ``True`` means the rich edit succeeded (or Telegram confirmed it was
+        already identical). ``False`` means a permanent rejection made a
+        MarkdownV2 fallback safe. Ambiguous/transient failures raise so callers
+        never issue a second edit after the rich request may have succeeded.
+        """
+        try:
+            await self._bot.do_api_request(
+                "editMessageText",
+                api_kwargs={
+                    "inline_message_id": state.inline_message_id,
+                    "rich_message": self._rich_message_payload(content),
+                },
+            )
+        except Exception as exc:
+            if "not modified" in str(exc).lower():
+                return True
+            if self._is_rich_fallback_error(exc):
+                if self._is_rich_capability_error(exc):
+                    self._rich_send_disabled = True
+                logger.info(
+                    "[Telegram Guest] Rich final rejected for query=%s; "
+                    "falling back to MarkdownV2: %s",
+                    query_ref,
+                    telegram_base._redact_telegram_error_text(exc),
+                )
+                return False
+            raise GuestEditError(
+                telegram_base._redact_telegram_error_text(exc)
+            ) from exc
+        logger.info(
+            "[Telegram Guest] Rich-finalized response query=%s chars=%d",
+            query_ref,
+            len(content),
+        )
+        return True
+
     async def _publish_guest(
         self,
         chat_id: str,
@@ -212,6 +270,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         *,
         allow_after_answer: bool = True,
         finalize: bool = False,
+        turn_final: bool = False,
     ) -> SendResult:
         state = self._guest_queries.get(chat_id)
         if state is None:
@@ -245,7 +304,30 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 text = state.latest_content
             if not text:
                 return SendResult(success=False, error="Empty guest response")
-            if telegram_base.utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+            if state.answered and state.rich_edit_ambiguous:
+                return SendResult(
+                    success=True,
+                    message_id=state.inline_message_id or chat_id,
+                )
+            rich_text = text
+            rich_rejected = state.rich_rejected_content == rich_text
+            rich_eligible = bool(
+                state.answered
+                and finalize
+                and turn_final
+                and not rich_rejected
+                and self._rich_eligible(rich_text)
+            )
+            if (
+                state.answered
+                and state.delivered_finalized
+                and rich_text == state.delivered_content
+            ):
+                return SendResult(
+                    success=True,
+                    message_id=state.inline_message_id or chat_id,
+                )
+            if not rich_eligible and telegram_base.utf16_len(text) > self.MAX_MESSAGE_LENGTH:
                 text = self.truncate_message(
                     text, self.MAX_MESSAGE_LENGTH, len_fn=telegram_base.utf16_len
                 )[0]
@@ -256,6 +338,33 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     raise GuestEditError(
                         "Guest response cannot be edited: missing inline_message_id"
                     )
+                if rich_eligible:
+                    # Consume the one safe rich attempt before awaiting I/O. If
+                    # cancellation or a transient error makes the outcome
+                    # ambiguous, later gateway reconciliation must not edit the
+                    # same inline message again.
+                    state.rich_edit_ambiguous = True
+                    rich_success = await self._try_edit_guest_rich(
+                        state, rich_text, query_ref
+                    )
+                    state.rich_edit_ambiguous = False
+                    if rich_success:
+                        state.rich_rejected_content = ""
+                        state.delivered_content = rich_text
+                        state.delivered_finalized = True
+                        return SendResult(
+                            success=True,
+                            message_id=state.inline_message_id,
+                        )
+                    rich_eligible = False
+                    state.rich_rejected_content = rich_text
+                    if telegram_base.utf16_len(rich_text) > self.MAX_MESSAGE_LENGTH:
+                        text = self.truncate_message(
+                            rich_text,
+                            self.MAX_MESSAGE_LENGTH,
+                            len_fn=telegram_base.utf16_len,
+                        )[0]
+                        state.latest_content = text
                 if text == state.delivered_content and (
                     not finalize or state.delivered_finalized
                 ):
@@ -331,6 +440,9 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     retryable=False,
                 )
             state.answer_attempted = True
+            self._answer_attempted_query_ids[state.query_id] = (
+                time.monotonic() + self.ANSWER_ATTEMPT_RETENTION_SECONDS
+            )
             result_id = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:32]
             result = InlineQueryResultArticle(
                 id=result_id,
@@ -403,6 +515,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             content,
             allow_after_answer=marked_visible,
             finalize=bool(metadata and metadata.get("notify")),
+            turn_final=bool(metadata and metadata.get("is_turn_final")),
         )
 
     async def send_or_update_status(
@@ -446,7 +559,12 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         state = self._guest_queries.get(str(chat_id))
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
-        return await self._publish_guest(str(chat_id), content, finalize=finalize)
+        return await self._publish_guest(
+            str(chat_id),
+            content,
+            finalize=finalize,
+            turn_final=bool(metadata and metadata.get("is_turn_final")),
+        )
 
     async def send_typing(
         self,

@@ -30,8 +30,10 @@ def adapter():
     instance._bot = SimpleNamespace(
         first_name="Test Bot",
         _post=AsyncMock(return_value={"inline_message_id": "guest-inline-1"}),
+        do_api_request=AsyncMock(return_value=True),
     )
     instance._guest_queries = {}
+    instance._answer_attempted_query_ids = {}
     instance._status_message_ids = {}
     return instance
 
@@ -55,6 +57,35 @@ async def test_guest_preview_answers_query_and_remembers_inline_message(adapter)
     assert result.message_id == "guest-inline-1"
     assert adapter._guest_queries[chat_id].latest_content == "partial"
     assert adapter._guest_queries[chat_id].inline_message_id == "guest-inline-1"
+
+
+@pytest.mark.asyncio
+async def test_answer_attempt_guard_survives_query_state_eviction(adapter):
+    adapter.MAX_RETAINED_QUERIES = 2
+    query_id = "query-evicted-replay"
+    chat_id = guest_chat_id(query_id)
+    adapter._remember_guest_query(chat_id, query_id)
+
+    first = await adapter.send(chat_id, "first", metadata={"expect_edits": True})
+    for index in range(2):
+        other_query_id = f"query-other-{index}"
+        adapter._remember_guest_query(
+            guest_chat_id(other_query_id),
+            other_query_id,
+        )
+
+    assert chat_id not in adapter._guest_queries
+    adapter._remember_guest_query(chat_id, query_id)
+    replay = await adapter.send(chat_id, "replay", metadata={"expect_edits": True})
+
+    assert first.success is True
+    assert replay.success is False
+    assert replay.retryable is False
+    answer_calls = [
+        call for call in adapter._bot._post.await_args_list
+        if call.args[0] == "answerGuestQuery"
+    ]
+    assert len(answer_calls) == 1
     adapter._bot._post.assert_awaited_once()
 
 
@@ -155,6 +186,189 @@ async def test_guest_final_edit_uses_telegram_markdown_v2(adapter, monkeypatch):
         "text": "*Bold* and `code`",
         "parse_mode": telegram_base.ParseMode.MARKDOWN_V2,
     }
+
+
+@pytest.mark.asyncio
+async def test_guest_final_edit_upgrades_eligible_content_to_rich(adapter):
+    chat_id = guest_chat_id("query-rich-final")
+    adapter._remember_guest_query(chat_id, "query-rich-final")
+    table = "| Name | Value |\n| --- | --- |\n" + "| guest | rich |\n" * 400
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    final = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+        metadata={"is_turn_final": True},
+    )
+    repeated = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+        metadata={"is_turn_final": True},
+    )
+
+    assert final.success is True
+    assert repeated.success is True
+    assert telegram_base.utf16_len(table) > adapter.MAX_MESSAGE_LENGTH
+    assert adapter._bot._post.await_count == 1
+    adapter._bot.do_api_request.assert_awaited_once_with(
+        "editMessageText",
+        api_kwargs={
+            "inline_message_id": "guest-inline-1",
+            "rich_message": adapter._rich_message_payload(table.strip()),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_guest_rich_final_rejection_keeps_first_markdown_finalize(adapter):
+    chat_id = guest_chat_id("query-rich-fallback")
+    adapter._remember_guest_query(chat_id, "query-rich-fallback")
+    table = "| Name | Value |\n| --- | --- |\n| guest | rich |"
+    adapter._bot.do_api_request.side_effect = BadRequest("rich parser rejected payload")
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    final = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+        metadata={"is_turn_final": True},
+    )
+
+    assert final.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    assert adapter._bot._post.await_count == 2
+    _, edit_call = adapter._bot._post.await_args_list
+    assert edit_call.args[0] == "editMessageText"
+    assert edit_call.args[1]["parse_mode"] == telegram_base.ParseMode.MARKDOWN_V2
+
+
+@pytest.mark.asyncio
+async def test_oversized_permanent_rich_rejection_is_not_retried(adapter):
+    chat_id = guest_chat_id("query-rich-long-rejected")
+    adapter._remember_guest_query(chat_id, "query-rich-long-rejected")
+    table = "| Name | Value |\n| --- | --- |\n" + "| guest | rich |\n" * 500
+    adapter._bot.do_api_request.side_effect = BadRequest("rich parser rejected payload")
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    results = await asyncio.gather(*(
+        adapter.edit_message(
+            chat_id,
+            preview.message_id,
+            table,
+            finalize=True,
+            metadata={"is_turn_final": True},
+        )
+        for _ in range(3)
+    ))
+
+    assert all(result.success for result in results)
+    assert telegram_base.utf16_len(table) > adapter.MAX_MESSAGE_LENGTH
+    assert adapter._bot.do_api_request.await_count == 1
+    assert adapter._bot._post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_guest_rich_final_transient_failure_does_not_legacy_edit(adapter):
+    chat_id = guest_chat_id("query-rich-transient")
+    adapter._remember_guest_query(chat_id, "query-rich-transient")
+    table = "| Name | Value |\n| --- | --- |\n| guest | rich |"
+    adapter._bot.do_api_request.side_effect = RuntimeError("connection reset")
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    with pytest.raises(GuestEditError, match="connection reset"):
+        await adapter.edit_message(
+            chat_id,
+            preview.message_id,
+            table,
+            finalize=True,
+            metadata={"is_turn_final": True},
+        )
+
+    assert adapter._bot._post.await_count == 1
+
+    reconciled = await adapter.send(
+        chat_id,
+        table,
+        metadata={"notify": True, "is_turn_final": True},
+    )
+
+    assert reconciled.success is True
+    assert adapter._bot.do_api_request.await_count == 1
+    assert adapter._bot._post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_guest_cancelled_rich_edit_is_not_retried(adapter):
+    chat_id = guest_chat_id("query-rich-cancelled")
+    adapter._remember_guest_query(chat_id, "query-rich-cancelled")
+    table = "| Name | Value |\n| --- | --- |\n| guest | rich |"
+    adapter._bot.do_api_request.side_effect = asyncio.CancelledError
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.edit_message(
+            chat_id,
+            preview.message_id,
+            table,
+            finalize=True,
+            metadata={"is_turn_final": True},
+        )
+
+    retried = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+        metadata={"is_turn_final": True},
+    )
+
+    assert retried.success is True
+    assert adapter._bot.do_api_request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_guest_rich_not_modified_counts_as_finalized(adapter):
+    chat_id = guest_chat_id("query-rich-not-modified")
+    adapter._remember_guest_query(chat_id, "query-rich-not-modified")
+    table = "| Name | Value |\n| --- | --- |\n| guest | rich |"
+    adapter._bot.do_api_request.side_effect = BadRequest("Message is not modified")
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    result = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+        metadata={"is_turn_final": True},
+    )
+
+    assert result.success is True
+    assert adapter._bot.do_api_request.await_count == 1
+    assert adapter._bot._post.await_count == 1
+    state = adapter._guest_queries[chat_id]
+    assert state.delivered_content == table
+    assert state.delivered_finalized is True
+    assert state.rich_edit_ambiguous is False
+
+
+@pytest.mark.asyncio
+async def test_eligible_first_guest_response_stays_within_legacy_limit(adapter):
+    chat_id = guest_chat_id("query-rich-first-long")
+    adapter._remember_guest_query(chat_id, "query-rich-first-long")
+    table = "| Name | Value |\n| --- | --- |\n" + "| guest | rich |\n" * 400
+
+    result = await adapter.send(chat_id, table, metadata={"notify": True})
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_awaited()
+    _, answer_payload = adapter._bot._post.await_args.args
+    initial_text = answer_payload["result"].input_message_content.message_text
+    assert telegram_base.utf16_len(initial_text) <= adapter.MAX_MESSAGE_LENGTH
 
 
 @pytest.mark.asyncio
@@ -526,6 +740,39 @@ async def test_stream_consumer_edit_failure_retries_complete_replacement(adapter
     assert adapter._guest_queries[chat_id].delivered_content == "Prefix and tail"
     _, final_payload = adapter._bot._post.await_args.args
     assert final_payload["text"] == "Prefix and tail"
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_only_rich_upgrades_true_turn_final(adapter):
+    chat_id = guest_chat_id("query-rich-boundary")
+    adapter._remember_guest_query(chat_id, "query-rich-boundary")
+    pre_tool = "| Step | State |\n| --- | --- |\n| lookup | pending |"
+    final = "| Step | State |\n| --- | --- |\n| lookup | complete |"
+    consumer = GatewayStreamConsumer(
+        adapter,
+        chat_id,
+        StreamConsumerConfig(cursor="", transport="edit", edit_interval=0.01),
+    )
+
+    run_task = asyncio.create_task(consumer.run())
+    for _ in range(3):
+        consumer.on_delta(pre_tool)
+        consumer.on_segment_break()
+        await asyncio.sleep(0.15)
+
+    adapter._bot.do_api_request.assert_not_awaited()
+
+    consumer.on_delta(final)
+    consumer.finish()
+    await asyncio.wait_for(run_task, timeout=2)
+
+    adapter._bot.do_api_request.assert_awaited_once_with(
+        "editMessageText",
+        api_kwargs={
+            "inline_message_id": "guest-inline-1",
+            "rich_message": adapter._rich_message_payload(final),
+        },
+    )
 
 
 @pytest.mark.asyncio
