@@ -11,6 +11,7 @@ from typing import Any
 from gateway.platforms.base import SendResult
 from plugins.platforms.telegram import adapter as telegram_base
 from telegram import InlineQueryResultArticle, InputTextMessageContent, Message, Update
+from telegram.error import BadRequest
 from telegram.ext import TypeHandler
 
 GUEST_UPDATE_TYPE = "guest_message"
@@ -37,6 +38,7 @@ class GuestQueryState:
     query_id: str
     latest_content: str = ""
     delivered_content: str = ""
+    delivered_finalized: bool = False
     answer_attempted: bool = False
     answer_error: str | None = None
     answered: bool = False
@@ -209,12 +211,18 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         content: str,
         *,
         allow_after_answer: bool = True,
+        finalize: bool = False,
     ) -> SendResult:
         state = self._guest_queries.get(chat_id)
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
+        query_ref = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:8]
         async with state.answer_lock:
             if state.answered and not allow_after_answer:
+                logger.info(
+                    "[Telegram Guest] Suppressed unmarked send after answer query=%s",
+                    query_ref,
+                )
                 return SendResult(
                     success=True,
                     message_id=state.inline_message_id or chat_id,
@@ -248,24 +256,68 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     raise GuestEditError(
                         "Guest response cannot be edited: missing inline_message_id"
                     )
-                if text == state.delivered_content:
+                if text == state.delivered_content and (
+                    not finalize or state.delivered_finalized
+                ):
                     return SendResult(
                         success=True,
                         message_id=state.inline_message_id,
                     )
                 try:
-                    raw_response = await self._bot._post(
-                        "editMessageText",
-                        {
-                            "inline_message_id": state.inline_message_id,
-                            "text": text,
-                        },
+                    logger.info(
+                        "[Telegram Guest] Editing response query=%s chars=%d",
+                        query_ref,
+                        len(text),
                     )
+                    payload = {
+                        "inline_message_id": state.inline_message_id,
+                        "text": text,
+                    }
+                    if finalize:
+                        payload["text"] = self.format_message(text)
+                        payload["parse_mode"] = telegram_base.ParseMode.MARKDOWN_V2
+                    try:
+                        raw_response = await self._bot._post(
+                            "editMessageText",
+                            payload,
+                        )
+                        state.delivered_finalized = finalize
+                    except Exception as format_exc:
+                        if not finalize or not isinstance(format_exc, BadRequest):
+                            raise
+                        if "not modified" in str(format_exc).lower():
+                            raw_response = True
+                            state.delivered_finalized = True
+                        else:
+                            logger.warning(
+                                "[Telegram Guest] MarkdownV2 edit failed for query=%s; "
+                                "falling back to plain text: %s",
+                                query_ref,
+                                telegram_base._redact_telegram_error_text(format_exc),
+                            )
+                            try:
+                                raw_response = await self._bot._post(
+                                    "editMessageText",
+                                    {
+                                        "inline_message_id": state.inline_message_id,
+                                        "text": text,
+                                    },
+                                )
+                            except BadRequest as plain_exc:
+                                if "not modified" not in str(plain_exc).lower():
+                                    raise
+                                raw_response = True
+                            state.delivered_finalized = True
                 except Exception as exc:
                     raise GuestEditError(
                         telegram_base._redact_telegram_error_text(exc)
                     ) from exc
                 state.delivered_content = text
+                logger.info(
+                    "[Telegram Guest] Edited response query=%s result_type=%s",
+                    query_ref,
+                    type(raw_response).__name__,
+                )
                 return SendResult(
                     success=True,
                     message_id=state.inline_message_id,
@@ -306,6 +358,14 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 inline_message_id = getattr(raw_response, "inline_message_id", None)
             state.inline_message_id = str(inline_message_id) if inline_message_id else None
             state.delivered_content = text
+            state.delivered_finalized = False
+            logger.info(
+                "[Telegram Guest] Answered query=%s chars=%d inline_id=%s result_type=%s",
+                query_ref,
+                len(text),
+                bool(state.inline_message_id),
+                type(raw_response).__name__,
+            )
             return SendResult(
                 success=True,
                 message_id=state.inline_message_id or chat_id,
@@ -342,6 +402,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             str(chat_id),
             content,
             allow_after_answer=marked_visible,
+            finalize=bool(metadata and metadata.get("notify")),
         )
 
     async def send_or_update_status(
@@ -385,7 +446,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         state = self._guest_queries.get(str(chat_id))
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
-        return await self._publish_guest(str(chat_id), content)
+        return await self._publish_guest(str(chat_id), content, finalize=finalize)
 
     async def send_typing(
         self,

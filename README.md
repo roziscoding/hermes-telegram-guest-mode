@@ -49,6 +49,7 @@ The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` pl
 - preserves Hermes' normal inbound message pipeline;
 - sends the first visible frame with `answerGuestQuery`, preserves the returned
   `inline_message_id`, and updates that same response with `editMessageText`;
+- applies Telegram MarkdownV2 formatting on the final inline edit, with a plain-text fallback when Telegram rejects the formatted payload;
 - suppresses internal lifecycle/status bubbles and prevents auxiliary footer sends from replacing a completed Guest response;
 - retains the complete pending replacement after an edit failure so Hermes can retry without replacing the response with a continuation-only tail;
 - delegates normal sends, edits, typing indicators, and ordinary updates to the bundled adapter;

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from telegram.error import BadRequest
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 for path in (PLUGIN_DIR,):
@@ -120,9 +121,129 @@ async def test_guest_preview_is_answered_then_final_edit_updates_same_message(ad
         "editMessageText",
         {
             "inline_message_id": "guest-inline-1",
-            "text": "Guest Mode lets bots answer without joining the chat.",
+            "text": "Guest Mode lets bots answer without joining the chat\\.",
+            "parse_mode": telegram_base.ParseMode.MARKDOWN_V2,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_guest_final_edit_uses_telegram_markdown_v2(adapter, monkeypatch):
+    chat_id = guest_chat_id("query-formatted-final")
+    adapter._remember_guest_query(chat_id, "query-formatted-final")
+    monkeypatch.setattr(
+        adapter,
+        "format_message",
+        MagicMock(return_value="*Bold* and `code`"),
+    )
+
+    preview = await adapter.send(
+        chat_id,
+        "**Bold** and `code`",
+        metadata={"expect_edits": True},
+    )
+    await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        "**Bold** and `code`",
+        finalize=True,
+    )
+
+    _, edit_payload = adapter._bot._post.await_args.args
+    assert edit_payload == {
+        "inline_message_id": "guest-inline-1",
+        "text": "*Bold* and `code`",
+        "parse_mode": telegram_base.ParseMode.MARKDOWN_V2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_guest_final_markdown_rejection_falls_back_to_plain_text(adapter):
+    chat_id = guest_chat_id("query-format-fallback")
+    adapter._remember_guest_query(chat_id, "query-format-fallback")
+    adapter._bot._post.side_effect = [
+        {"inline_message_id": "guest-inline-1"},
+        BadRequest("can't parse entities"),
+        True,
+    ]
+
+    preview = await adapter.send(
+        chat_id,
+        "Preview",
+        metadata={"expect_edits": True},
+    )
+    final = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        "**Bold** final",
+        finalize=True,
+    )
+
+    assert final.success is True
+    assert adapter._bot._post.await_args.args == (
+        "editMessageText",
+        {
+            "inline_message_id": "guest-inline-1",
+            "text": "**Bold** final",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_unchanged_guest_final_treats_not_modified_as_success(adapter):
+    chat_id = guest_chat_id("query-not-modified")
+    adapter._remember_guest_query(chat_id, "query-not-modified")
+    adapter._bot._post.side_effect = [
+        {"inline_message_id": "guest-inline-1"},
+        BadRequest("Message is not modified"),
+    ]
+
+    preview = await adapter.send(
+        chat_id,
+        "Already final",
+        metadata={"expect_edits": True},
+    )
+    final = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        "Already final",
+        finalize=True,
+    )
+
+    assert final.success is True
+    assert adapter._bot._post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_plain_fallback_marks_identical_guest_final_complete(adapter):
+    chat_id = guest_chat_id("query-fallback-complete")
+    adapter._remember_guest_query(chat_id, "query-fallback-complete")
+    adapter._bot._post.side_effect = [
+        {"inline_message_id": "guest-inline-1"},
+        BadRequest("can't parse entities"),
+        True,
+    ]
+
+    preview = await adapter.send(
+        chat_id,
+        "Preview",
+        metadata={"expect_edits": True},
+    )
+    first_final = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        "**Bold** final",
+        finalize=True,
+    )
+    repeated_final = await adapter.send(
+        chat_id,
+        "**Bold** final",
+        metadata={"notify": True},
+    )
+
+    assert first_final.success is True
+    assert repeated_final.success is True
+    assert adapter._bot._post.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -175,12 +296,16 @@ async def test_transformed_final_edit_cannot_suppress_turn_final_send(adapter):
     )
 
     assert result.success is True
-    assert adapter._bot._post.await_count == 2
-    answer_call, edit_call = adapter._bot._post.await_args_list
+    assert adapter._bot._post.await_count == 3
+    answer_call, _, edit_call = adapter._bot._post.await_args_list
     assert answer_call.args[0] == "answerGuestQuery"
     assert edit_call.args == (
         "editMessageText",
-        {"inline_message_id": "guest-inline-1", "text": "transformed final"},
+        {
+            "inline_message_id": "guest-inline-1",
+            "text": "transformed final",
+            "parse_mode": telegram_base.ParseMode.MARKDOWN_V2,
+        },
     )
 
 
@@ -210,7 +335,11 @@ async def test_post_tool_segment_edits_the_existing_guest_response(adapter):
     assert answer_call.args[0] == "answerGuestQuery"
     assert edit_call.args == (
         "editMessageText",
-        {"inline_message_id": "guest-inline-1", "text": "post-tool final answer"},
+        {
+            "inline_message_id": "guest-inline-1",
+            "text": "post\\-tool final answer",
+            "parse_mode": telegram_base.ParseMode.MARKDOWN_V2,
+        },
     )
 
 
