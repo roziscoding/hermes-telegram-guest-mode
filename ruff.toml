@@ -1,0 +1,6 @@
+[lint]
+extend-select = ["B", "I", "N", "UP"]
+
+[lint.per-file-ignores]
+"__init__.py" = ["N999"]
+"tests/*.py" = ["E402"]
