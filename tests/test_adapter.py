@@ -2,9 +2,10 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 for path in (PLUGIN_DIR,):
@@ -15,7 +16,7 @@ from gateway.platforms.base import SendResult
 from plugins.platforms.telegram import adapter as telegram_base
 
 from adapter import (
-    GuestFinalizationDeferredError,
+    GuestEditError,
     GuestTelegramAdapter,
     guest_chat_id,
     is_guest_chat_id,
@@ -30,6 +31,7 @@ def adapter():
         _post=AsyncMock(return_value={"inline_message_id": "guest-inline-1"}),
     )
     instance._guest_queries = {}
+    instance._status_message_ids = {}
     return instance
 
 
@@ -42,36 +44,97 @@ def test_guest_chat_ids_are_namespaced_and_round_trip():
 
 
 @pytest.mark.asyncio
-async def test_guest_preview_is_buffered_without_calling_telegram(adapter):
+async def test_guest_preview_answers_query_and_remembers_inline_message(adapter):
     chat_id = guest_chat_id("query-123")
     adapter._remember_guest_query(chat_id, "query-123")
 
     result = await adapter.send(chat_id, "partial", metadata={"expect_edits": True})
 
     assert result.success is True
-    assert result.message_id == chat_id
+    assert result.message_id == "guest-inline-1"
     assert adapter._guest_queries[chat_id].latest_content == "partial"
-    adapter._bot._post.assert_not_awaited()
+    assert adapter._guest_queries[chat_id].inline_message_id == "guest-inline-1"
+    adapter._bot._post.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_guest_final_edit_defers_to_turn_final_send(adapter):
+async def test_legitimate_short_final_is_not_mistaken_for_failed_edit_tail(adapter):
+    chat_id = guest_chat_id("query-short-final")
+    adapter._remember_guest_query(chat_id, "query-short-final")
+
+    await adapter.send(chat_id, "Research answer", metadata={})
+    await adapter.send(chat_id, "answer", metadata={"notify": True})
+
+    assert adapter._guest_queries[chat_id].delivered_content == "answer"
+    _, final_payload = adapter._bot._post.await_args.args
+    assert final_payload["text"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_unmarked_first_commentary_is_replaced_by_marked_final_answer(adapter):
+    chat_id = guest_chat_id("query-commentary")
+    adapter._remember_guest_query(chat_id, "query-commentary")
+
+    commentary = await adapter.send(chat_id, "Searching the web…", metadata={})
+    final = await adapter.send(
+        chat_id,
+        "Guest Mode lets bots answer without joining the chat.",
+        metadata={"notify": True},
+    )
+
+    assert commentary.message_id == "guest-inline-1"
+    assert final.message_id == "guest-inline-1"
+    assert [call.args[0] for call in adapter._bot._post.await_args_list] == [
+        "answerGuestQuery",
+        "editMessageText",
+    ]
+    assert adapter._guest_queries[chat_id].delivered_content == (
+        "Guest Mode lets bots answer without joining the chat."
+    )
+
+
+@pytest.mark.asyncio
+async def test_guest_preview_is_answered_then_final_edit_updates_same_message(adapter):
     chat_id = guest_chat_id("query-123")
     adapter._remember_guest_query(chat_id, "query-123")
 
-    with pytest.raises(GuestFinalizationDeferredError):
-        await adapter.edit_message(
-            chat_id,
-            chat_id,
-            "final answer",
-            finalize=True,
-        )
-    adapter._bot._post.assert_not_awaited()
+    preview = await adapter.send(
+        chat_id,
+        "Searching the web…",
+        metadata={"notify": True, "expect_edits": True},
+    )
+    final = await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        "Guest Mode lets bots answer without joining the chat.",
+        finalize=True,
+    )
 
-    final = await adapter.send(
+    assert preview.success is True
+    assert preview.message_id == "guest-inline-1"
+    assert final.success is True
+    assert adapter._bot._post.await_count == 2
+    answer_call, edit_call = adapter._bot._post.await_args_list
+    assert answer_call.args[0] == "answerGuestQuery"
+    assert edit_call.args == (
+        "editMessageText",
+        {
+            "inline_message_id": "guest-inline-1",
+            "text": "Guest Mode lets bots answer without joining the chat.",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_guest_final_edit_is_first_delivery_when_no_preview_exists(adapter):
+    chat_id = guest_chat_id("query-123")
+    adapter._remember_guest_query(chat_id, "query-123")
+
+    final = await adapter.edit_message(
+        chat_id,
         chat_id,
         "actual final answer",
-        metadata={"notify": True},
+        finalize=True,
     )
 
     assert final.success is True
@@ -92,20 +155,18 @@ async def test_transformed_final_edit_cannot_suppress_turn_final_send(adapter):
         "streamed original",
         metadata={"expect_edits": True},
     )
-    with pytest.raises(GuestFinalizationDeferredError):
-        await adapter.edit_message(
-            chat_id,
-            chat_id,
-            "streamed original",
-            finalize=True,
-        )
-    with pytest.raises(GuestFinalizationDeferredError):
-        await adapter.edit_message(
-            chat_id,
-            chat_id,
-            "transformed final",
-            finalize=True,
-        )
+    await adapter.edit_message(
+        chat_id,
+        "guest-inline-1",
+        "streamed original",
+        finalize=True,
+    )
+    await adapter.edit_message(
+        chat_id,
+        "guest-inline-1",
+        "transformed final",
+        finalize=True,
+    )
 
     result = await adapter.send(
         chat_id,
@@ -114,13 +175,17 @@ async def test_transformed_final_edit_cannot_suppress_turn_final_send(adapter):
     )
 
     assert result.success is True
-    assert adapter._bot._post.await_count == 1
-    _, data = adapter._bot._post.await_args.args
-    assert data["result"].input_message_content.message_text == "transformed final"
+    assert adapter._bot._post.await_count == 2
+    answer_call, edit_call = adapter._bot._post.await_args_list
+    assert answer_call.args[0] == "answerGuestQuery"
+    assert edit_call.args == (
+        "editMessageText",
+        {"inline_message_id": "guest-inline-1", "text": "transformed final"},
+    )
 
 
 @pytest.mark.asyncio
-async def test_stream_segment_send_does_not_answer_guest_query(adapter):
+async def test_post_tool_segment_edits_the_existing_guest_response(adapter):
     chat_id = guest_chat_id("query-segment")
     adapter._remember_guest_query(chat_id, "query-segment")
 
@@ -131,7 +196,7 @@ async def test_stream_segment_send_does_not_answer_guest_query(adapter):
     )
 
     assert preview.success is True
-    adapter._bot._post.assert_not_awaited()
+    assert preview.message_id == "guest-inline-1"
 
     final = await adapter.send(
         chat_id,
@@ -140,9 +205,13 @@ async def test_stream_segment_send_does_not_answer_guest_query(adapter):
     )
 
     assert final.success is True
-    assert adapter._bot._post.await_count == 1
-    _, data = adapter._bot._post.await_args.args
-    assert data["result"].input_message_content.message_text == "post-tool final answer"
+    assert adapter._bot._post.await_count == 2
+    answer_call, edit_call = adapter._bot._post.await_args_list
+    assert answer_call.args[0] == "answerGuestQuery"
+    assert edit_call.args == (
+        "editMessageText",
+        {"inline_message_id": "guest-inline-1", "text": "post-tool final answer"},
+    )
 
 
 @pytest.mark.asyncio
@@ -156,7 +225,9 @@ async def test_concurrent_final_sends_call_answer_guest_query_once(adapter):
     )
 
     assert all(result.success for result in results)
-    assert adapter._bot._post.await_count == 1
+    methods = [call.args[0] for call in adapter._bot._post.await_args_list]
+    assert methods.count("answerGuestQuery") == 1
+    assert methods.count("editMessageText") == 1
 
 
 @pytest.mark.asyncio
@@ -171,6 +242,262 @@ async def test_guest_final_send_answers_query_without_streaming(adapter):
     _, data = adapter._bot._post.await_args.args
     assert data["guest_query_id"] == "query-456"
     assert data["result"].input_message_content.message_text == "plain final"
+
+
+@pytest.mark.asyncio
+async def test_failed_guest_edit_can_retry_without_losing_final_content(adapter):
+    chat_id = guest_chat_id("query-retry")
+    adapter._remember_guest_query(chat_id, "query-retry")
+    adapter._bot._post.side_effect = [
+        {"inline_message_id": "guest-inline-1"},
+        RuntimeError("temporary edit failure"),
+        True,
+    ]
+
+    await adapter.send(chat_id, "Searching…", metadata={"expect_edits": True})
+    with pytest.raises(GuestEditError):
+        await adapter.edit_message(
+            chat_id,
+            "guest-inline-1",
+            "Final answer",
+            finalize=True,
+        )
+    retried = await adapter.send(
+        chat_id,
+        "answer",
+        metadata={"notify": True},
+    )
+
+    assert retried.success is True
+    assert adapter._guest_queries[chat_id].delivered_content == "Final answer"
+    assert [call.args[0] for call in adapter._bot._post.await_args_list] == [
+        "answerGuestQuery",
+        "editMessageText",
+        "editMessageText",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_concurrent_edit_cannot_corrupt_pending_full_retry(adapter):
+    chat_id = guest_chat_id("query-concurrent-cancel")
+    adapter._remember_guest_query(chat_id, "query-concurrent-cancel")
+    edit_started = asyncio.Event()
+    release_edit = asyncio.Event()
+    calls = 0
+
+    async def post(method, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"inline_message_id": "guest-inline-1"}
+        if calls == 2:
+            edit_started.set()
+            await release_edit.wait()
+            raise RuntimeError("temporary edit failure")
+        return True
+
+    adapter._bot._post.side_effect = post
+    await adapter.send(chat_id, "Prefix", metadata={"expect_edits": True})
+
+    failing = asyncio.create_task(
+        adapter.edit_message(
+            chat_id,
+            "guest-inline-1",
+            "Prefix and tail",
+            finalize=True,
+        )
+    )
+    await edit_started.wait()
+    cancelled = asyncio.create_task(
+        adapter.edit_message(
+            chat_id,
+            "guest-inline-1",
+            "Cancelled replacement",
+            finalize=True,
+        )
+    )
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    release_edit.set()
+    with pytest.raises(GuestEditError):
+        await failing
+
+    retried = await adapter.send(
+        chat_id,
+        "and tail",
+        metadata={"notify": True},
+    )
+
+    assert retried.success is True
+    assert adapter._guest_queries[chat_id].delivered_content == "Prefix and tail"
+    _, final_payload = adapter._bot._post.await_args.args
+    assert final_payload["text"] == "Prefix and tail"
+
+
+@pytest.mark.asyncio
+async def test_answer_guest_query_transport_failure_is_never_retried(adapter):
+    chat_id = guest_chat_id("query-answer-timeout")
+    adapter._remember_guest_query(chat_id, "query-answer-timeout")
+    adapter._bot._post.side_effect = RuntimeError("Timed out")
+
+    first = await adapter.send(chat_id, "Answer", metadata={"notify": True})
+    second = await adapter.send(chat_id, "Answer", metadata={"notify": True})
+
+    assert first.success is False
+    assert first.retryable is False
+    assert second.success is False
+    assert second.retryable is False
+    adapter._bot._post.assert_awaited_once()
+
+
+def test_guest_stream_limit_prevents_stream_consumer_chunk_replacement(
+    adapter, monkeypatch
+):
+    parent_limit = MagicMock(return_value=4096)
+    monkeypatch.setattr(
+        telegram_base.TelegramAdapter,
+        "max_message_length_for_chat",
+        parent_limit,
+    )
+
+    assert adapter.max_message_length_for_chat("guest:query-long") > 1_000_000
+    assert adapter.max_message_length_for_chat("16715013") == 4096
+    parent_limit.assert_called_once_with("16715013")
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_edit_failure_retries_complete_replacement(adapter):
+    chat_id = guest_chat_id("query-stream-fallback")
+    adapter._remember_guest_query(chat_id, "query-stream-fallback")
+    adapter._bot._post.side_effect = [
+        {"inline_message_id": "guest-inline-1"},
+        RuntimeError("temporary edit failure"),
+        True,
+    ]
+    consumer = GatewayStreamConsumer(
+        adapter,
+        chat_id,
+        StreamConsumerConfig(cursor="", transport="edit"),
+    )
+
+    assert await consumer._send_or_edit("Prefix") is True
+    assert not await consumer._send_or_edit("Prefix and tail")
+    assert consumer._fallback_final_send is False
+
+    retried = await adapter.send(
+        chat_id,
+        "and tail",
+        metadata={"notify": True},
+    )
+
+    assert retried.success is True
+    assert adapter._guest_queries[chat_id].delivered_content == "Prefix and tail"
+    _, final_payload = adapter._bot._post.await_args.args
+    assert final_payload["text"] == "Prefix and tail"
+
+
+@pytest.mark.asyncio
+async def test_missing_inline_message_id_raises_instead_of_claiming_edit_delivery(adapter):
+    chat_id = guest_chat_id("query-missing-inline")
+    adapter._remember_guest_query(chat_id, "query-missing-inline")
+    adapter._bot._post.return_value = {}
+
+    initial = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+
+    assert initial.success is True
+    with pytest.raises(GuestEditError):
+        await adapter.edit_message(
+            chat_id,
+            chat_id,
+            "Final answer",
+            finalize=True,
+        )
+    adapter._bot._post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transformed_edit_failure_raises_for_gateway_reconciliation(adapter):
+    chat_id = guest_chat_id("query-transformed-failure")
+    adapter._remember_guest_query(chat_id, "query-transformed-failure")
+    adapter._bot._post.side_effect = [
+        {"inline_message_id": "guest-inline-1"},
+        RuntimeError("temporary edit failure"),
+    ]
+
+    await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+
+    with pytest.raises(GuestEditError):
+        await adapter.edit_message(
+            chat_id,
+            "guest-inline-1",
+            "Plugin-transformed final",
+            finalize=True,
+        )
+
+    assert adapter._guest_queries[chat_id].delivered_content == "Preview"
+    assert adapter._guest_queries[chat_id].latest_content == "Plugin-transformed final"
+
+
+@pytest.mark.asyncio
+async def test_unmarked_auxiliary_queued_during_initial_answer_is_suppressed(adapter):
+    chat_id = guest_chat_id("query-inflight-footer")
+    adapter._remember_guest_query(chat_id, "query-inflight-footer")
+    answer_started = asyncio.Event()
+    release_answer = asyncio.Event()
+
+    async def post(method, data):
+        answer_started.set()
+        await release_answer.wait()
+        return {"inline_message_id": "guest-inline-1"}
+
+    adapter._bot._post.side_effect = post
+    initial = asyncio.create_task(adapter.send(chat_id, "Initial commentary", metadata={}))
+    await answer_started.wait()
+    auxiliary = asyncio.create_task(adapter.send(chat_id, "Model: gpt-test", metadata={}))
+    await asyncio.sleep(0)
+    release_answer.set()
+
+    initial_result, auxiliary_result = await asyncio.gather(initial, auxiliary)
+
+    assert initial_result.success is True
+    assert auxiliary_result.success is True
+    assert adapter._guest_queries[chat_id].delivered_content == "Initial commentary"
+    assert adapter._guest_queries[chat_id].latest_content == "Initial commentary"
+    adapter._bot._post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_send_cannot_replace_completed_guest_answer(adapter):
+    chat_id = guest_chat_id("query-footer")
+    adapter._remember_guest_query(chat_id, "query-footer")
+
+    await adapter.send(chat_id, "Final answer", metadata={"notify": True})
+    footer = await adapter.send(chat_id, "Model: gpt-test", metadata={})
+
+    assert footer.success is True
+    assert footer.message_id == "guest-inline-1"
+    assert adapter._guest_queries[chat_id].delivered_content == "Final answer"
+    assert adapter._guest_queries[chat_id].latest_content == "Final answer"
+    adapter._bot._post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guest_status_updates_never_consume_or_replace_guest_response(adapter):
+    chat_id = guest_chat_id("query-status")
+    adapter._remember_guest_query(chat_id, "query-status")
+
+    first = await adapter.send_or_update_status(chat_id, "tool", "Searching…")
+    second = await adapter.send_or_update_status(chat_id, "tool", "Search complete")
+
+    assert first.success is True
+    assert second.success is True
+    assert first.message_id is None
+    assert second.message_id is None
+    assert adapter._guest_queries[chat_id].latest_content == ""
+    adapter._bot._post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -352,6 +679,32 @@ async def test_unauthorized_guest_update_is_ignored(adapter):
 
     adapter.handle_message.assert_not_awaited()
     assert adapter._guest_queries == {}
+
+
+@pytest.mark.asyncio
+async def test_normal_status_updates_delegate_to_bundled_adapter(adapter, monkeypatch):
+    expected = SendResult(success=True, message_id="status-1")
+    parent_status = AsyncMock(return_value=expected)
+    monkeypatch.setattr(
+        telegram_base.TelegramAdapter,
+        "send_or_update_status",
+        parent_status,
+    )
+
+    result = await adapter.send_or_update_status(
+        "16715013",
+        "tool",
+        "Searching…",
+        metadata={"thread_id": "8"},
+    )
+
+    assert result is expected
+    parent_status.assert_awaited_once_with(
+        "16715013",
+        "tool",
+        "Searching…",
+        metadata={"thread_id": "8"},
+    )
 
 
 @pytest.mark.asyncio

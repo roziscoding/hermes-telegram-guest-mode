@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 _UPDATE_TYPES_LOCK = asyncio.Lock()
 
 
+class GuestEditError(RuntimeError):
+    """A Guest edit failed and the gateway must keep the final response eligible."""
+
+
 def guest_chat_id(query_id: str) -> str:
     return f"{GUEST_CHAT_PREFIX}{query_id}"
 
@@ -32,18 +36,19 @@ def is_guest_chat_id(chat_id: object) -> bool:
 class GuestQueryState:
     query_id: str
     latest_content: str = ""
+    delivered_content: str = ""
+    answer_attempted: bool = False
+    answer_error: str | None = None
     answered: bool = False
+    inline_message_id: str | None = None
     answer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-
-
-class GuestFinalizationDeferredError(RuntimeError):
-    """Force Hermes to use its ordinary turn-final send path for Guest Mode."""
 
 
 class GuestTelegramAdapter(telegram_base.TelegramAdapter):
     """Thin native Guest Mode layer over Hermes' bundled Telegram adapter."""
 
     MAX_RETAINED_QUERIES = 1024
+    GUEST_STREAM_CONSUMER_LIMIT = 2_147_483_647
 
     def __init__(self, config):
         super().__init__(config)
@@ -198,17 +203,38 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             self._ensure_guest_handler(self._app)
         return connected
 
-    async def _answer_guest(self, chat_id: str, content: str) -> SendResult:
+    async def _publish_guest(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        allow_after_answer: bool = True,
+    ) -> SendResult:
         state = self._guest_queries.get(chat_id)
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
         async with state.answer_lock:
-            if state.answered:
-                return SendResult(success=True, message_id=chat_id)
+            if state.answered and not allow_after_answer:
+                return SendResult(
+                    success=True,
+                    message_id=state.inline_message_id or chat_id,
+                )
             if not self._bot:
                 return SendResult(success=False, error="Not connected")
 
             text = (content or state.latest_content or "").strip()
+            if (
+                state.answered
+                and state.latest_content
+                and state.latest_content != state.delivered_content
+                and text != state.latest_content
+                and state.latest_content.endswith(text)
+            ):
+                # Hermes fallback sends only an un-delivered suffix because most
+                # platforms can append a fresh message. Guest Bots own one inline
+                # response, so replacing it with that suffix would truncate the
+                # visible answer. Retry the complete pending replacement instead.
+                text = state.latest_content
             if not text:
                 return SendResult(success=False, error="Empty guest response")
             if telegram_base.utf16_len(text) > self.MAX_MESSAGE_LENGTH:
@@ -217,6 +243,42 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 )[0]
             state.latest_content = text
 
+            if state.answered:
+                if not state.inline_message_id:
+                    raise GuestEditError(
+                        "Guest response cannot be edited: missing inline_message_id"
+                    )
+                if text == state.delivered_content:
+                    return SendResult(
+                        success=True,
+                        message_id=state.inline_message_id,
+                    )
+                try:
+                    raw_response = await self._bot._post(
+                        "editMessageText",
+                        {
+                            "inline_message_id": state.inline_message_id,
+                            "text": text,
+                        },
+                    )
+                except Exception as exc:
+                    raise GuestEditError(
+                        telegram_base._redact_telegram_error_text(exc)
+                    ) from exc
+                state.delivered_content = text
+                return SendResult(
+                    success=True,
+                    message_id=state.inline_message_id,
+                    raw_response=raw_response,
+                )
+
+            if state.answer_attempted:
+                return SendResult(
+                    success=False,
+                    error=state.answer_error or "Guest response was already attempted",
+                    retryable=False,
+                )
+            state.answer_attempted = True
             result_id = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:32]
             result = InlineQueryResultArticle(
                 id=result_id,
@@ -229,21 +291,34 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     {"guest_query_id": state.query_id, "result": result},
                 )
             except Exception as exc:  # noqa: BLE001 - isolate transport failures
+                state.answer_error = telegram_base._redact_telegram_error_text(exc)
                 return SendResult(
                     success=False,
-                    error=telegram_base._redact_telegram_error_text(exc),
-                    retryable=True,
+                    error=state.answer_error,
+                    retryable=False,
                 )
 
             state.answered = True
             inline_message_id = None
             if isinstance(raw_response, dict):
                 inline_message_id = raw_response.get("inline_message_id")
+            if inline_message_id is None:
+                inline_message_id = getattr(raw_response, "inline_message_id", None)
+            state.inline_message_id = str(inline_message_id) if inline_message_id else None
+            state.delivered_content = text
             return SendResult(
                 success=True,
-                message_id=str(inline_message_id or chat_id),
+                message_id=state.inline_message_id or chat_id,
                 raw_response=raw_response,
             )
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        if is_guest_chat_id(chat_id):
+            # Prevent StreamConsumer from splitting one replaceable Guest bubble
+            # into append-only chunks. _publish_guest enforces Telegram's actual
+            # 4096 UTF-16-unit cap before each answer/edit request.
+            return self.GUEST_STREAM_CONSUMER_LIMIT
+        return super().max_message_length_for_chat(chat_id)
 
     async def send(
         self,
@@ -258,14 +333,36 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         state = self._guest_queries.get(str(chat_id))
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
-        state.latest_content = content or state.latest_content
-        if (
-            metadata
-            and metadata.get("notify")
-            and not metadata.get("expect_edits")
-        ):
-            return await self._answer_guest(str(chat_id), content)
-        return SendResult(success=True, message_id=str(chat_id))
+        marked_visible = bool(
+            metadata and (metadata.get("expect_edits") or metadata.get("notify"))
+        )
+        # The answered check happens under answer_lock so an auxiliary send queued
+        # behind the initial response cannot become an accidental second frame.
+        return await self._publish_guest(
+            str(chat_id),
+            content,
+            allow_after_answer=marked_visible,
+        )
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        if not is_guest_chat_id(chat_id):
+            return await super().send_or_update_status(
+                chat_id,
+                status_key,
+                content,
+                metadata=metadata,
+            )
+        state = self._guest_queries.get(str(chat_id))
+        if state is None:
+            return SendResult(success=False, error="Unknown guest query")
+        return SendResult(success=True)
 
     async def edit_message(
         self,
@@ -288,15 +385,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         state = self._guest_queries.get(str(chat_id))
         if state is None:
             return SendResult(success=False, error="Unknown guest query")
-        state.latest_content = content or state.latest_content
-        if finalize:
-            # finalize=True also closes pre-tool stream segments. Raising here
-            # makes both the stream consumer and transformed-output reconciliation
-            # preserve Hermes' ordinary turn-final send instead of suppressing it.
-            raise GuestFinalizationDeferredError(
-                "Telegram Guest response deferred to the turn-final send"
-            )
-        return SendResult(success=True, message_id=str(message_id or chat_id))
+        return await self._publish_guest(str(chat_id), content)
 
     async def send_typing(
         self,

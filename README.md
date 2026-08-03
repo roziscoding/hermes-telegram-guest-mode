@@ -47,7 +47,10 @@ The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` pl
 - requests the `guest_message` update type;
 - installs a handler before Telegram polling starts;
 - preserves Hermes' normal inbound message pipeline;
-- buffers streaming output and sends exactly one `answerGuestQuery` result;
+- sends the first visible frame with `answerGuestQuery`, preserves the returned
+  `inline_message_id`, and updates that same response with `editMessageText`;
+- suppresses internal lifecycle/status bubbles and prevents auxiliary footer sends from replacing a completed Guest response;
+- retains the complete pending replacement after an edit failure so Hermes can retry without replacing the response with a continuation-only tail;
 - delegates normal sends, edits, typing indicators, and ordinary updates to the bundled adapter;
 - authorizes the Guest caller through Hermes' user-level Telegram policy, including adapter allowlists, environment allowlists, pairing, and global policy.
 
@@ -56,7 +59,7 @@ If the guest handler cannot be installed, ordinary Telegram startup continues. A
 ## Current limitations
 
 - Text guest messages and text responses only.
-- Telegram permits one guest response, so visible streaming is condensed into the final answer.
+- Telegram permits one initial guest response. The plugin uses inline-message edits to update that response during streaming and after tool calls; it cannot send a second independent guest message. After any failed or ambiguous `answerGuestQuery` attempt, it fails closed instead of risking a second initial response.
 - Interactive polls/clarification prompts and multiple assistant messages cannot be delivered through a guest query.
 - Guest replies are capped at Telegram's 4,096 UTF-16-unit text limit.
 - The plugin depends on private Hermes adapter methods and may need updates when Hermes changes them.
