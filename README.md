@@ -4,7 +4,7 @@ Native [Telegram Guest Bot](https://core.telegram.org/bots/features#guest-bots) 
 
 Guest Mode lets someone mention your bot in a Telegram chat where the bot is **not a member**. Telegram sends the bot limited context and allows one response. This plugin adds that update and response path while delegating ordinary Telegram traffic to Hermes' bundled adapter.
 
-> **Compatibility:** verified with Hermes `v0.19.1` and `python-telegram-bot 22.6`. The plugin subclasses private Telegram adapter methods, so a future Hermes update may require a compatibility fix.
+> **Compatibility:** verified with Hermes `v0.20.0` and `python-telegram-bot 22.6`. The plugin subclasses private Telegram adapter methods, so a future Hermes update may require a compatibility fix.
 
 ## Install with Hermes
 
@@ -46,6 +46,8 @@ The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` pl
 
 - requests the `guest_message` update type;
 - installs a handler before Telegram polling starts;
+- accepts text or captions plus Hermes-supported direct and replied-to content through a registry-based dispatcher: photos, videos, audio, voice notes, documents, locations/venues, and stickers;
+- preserves quoted voice notes as `VOICE` events so Hermes sends them through automatic speech-to-text;
 - preserves Hermes' normal inbound message pipeline;
 - sends the first visible frame with `answerGuestQuery`, preserves the returned
   `inline_message_id`, and updates that same response with `editMessageText`;
@@ -60,11 +62,11 @@ If the guest handler cannot be installed, ordinary Telegram startup continues. A
 
 ## Current limitations
 
-- Text guest messages and text responses only.
+- Guest responses are text/rich-text only. Inbound polls, contacts, dice, animations, video notes, and other Telegram message classes without a Hermes `MessageType` are currently ignored unless their text/caption is independently useful.
 - Telegram permits one initial guest response. The plugin uses inline-message edits to update that response during streaming and after tool calls; it cannot send a second independent guest message. After any failed or ambiguous `answerGuestQuery` attempt, it fails closed instead of risking a second initial response. Attempted query IDs remain in a separate 24-hour process-local replay guard even if detailed query state is evicted.
 - Interactive polls/clarification prompts and multiple assistant messages cannot be delivered through a guest query.
 - Initial and legacy Guest text is capped at Telegram's 4,096 UTF-16-unit limit. Eligible streamed responses can upgrade in place to a final rich message up to Telegram's 32,768-character rich limit.
-- Rich final promotion requires a Hermes core that supplies explicit `is_turn_final` stream metadata; older cores safely remain on the legacy path.
+- Rich final promotion requires a Hermes core that supplies explicit `is_turn_final` stream metadata; cores that do not propagate it safely remain on the legacy MarkdownV2/plain path.
 - The plugin depends on private Hermes adapter methods and may need updates when Hermes changes them.
 
 ## Troubleshooting

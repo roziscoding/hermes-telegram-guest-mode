@@ -224,6 +224,29 @@ async def test_guest_final_edit_upgrades_eligible_content_to_rich(adapter):
 
 
 @pytest.mark.asyncio
+async def test_duplicate_finalizes_without_turn_metadata_do_not_promote_rich(adapter):
+    chat_id = guest_chat_id("query-duplicate-boundary")
+    adapter._remember_guest_query(chat_id, "query-duplicate-boundary")
+    table = "| Name | Value |\n| --- | --- |\n| guest | boundary |"
+
+    preview = await adapter.send(chat_id, "Preview", metadata={"expect_edits": True})
+    await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+    )
+    await adapter.edit_message(
+        chat_id,
+        preview.message_id,
+        table,
+        finalize=True,
+    )
+
+    adapter._bot.do_api_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_guest_rich_final_rejection_keeps_first_markdown_finalize(adapter):
     chat_id = guest_chat_id("query-rich-fallback")
     adapter._remember_guest_query(chat_id, "query-rich-fallback")
@@ -743,7 +766,7 @@ async def test_stream_consumer_edit_failure_retries_complete_replacement(adapter
 
 
 @pytest.mark.asyncio
-async def test_stream_consumer_only_rich_upgrades_true_turn_final(adapter):
+async def test_stream_consumer_without_turn_metadata_stays_legacy(adapter):
     chat_id = guest_chat_id("query-rich-boundary")
     adapter._remember_guest_query(chat_id, "query-rich-boundary")
     pre_tool = "| Step | State |\n| --- | --- |\n| lookup | pending |"
@@ -766,13 +789,11 @@ async def test_stream_consumer_only_rich_upgrades_true_turn_final(adapter):
     consumer.finish()
     await asyncio.wait_for(run_task, timeout=2)
 
-    adapter._bot.do_api_request.assert_awaited_once_with(
-        "editMessageText",
-        api_kwargs={
-            "inline_message_id": "guest-inline-1",
-            "rich_message": adapter._rich_message_payload(final),
-        },
-    )
+    adapter._bot.do_api_request.assert_not_awaited()
+    assert adapter._guest_queries[chat_id].delivered_content == final
+    method, payload = adapter._bot._post.await_args.args
+    assert method == "editMessageText"
+    assert payload["parse_mode"] == telegram_base.ParseMode.MARKDOWN_V2
 
 
 @pytest.mark.asyncio
@@ -1031,6 +1052,275 @@ async def test_guest_update_is_dispatched_on_synthetic_chat(adapter, monkeypatch
     assert event.source.chat_type == "guest"
     assert event.text == "@aster oi"
     assert adapter._guest_queries["guest:query-77"].query_id == "query-77"
+
+
+@pytest.mark.asyncio
+async def test_guest_update_includes_replied_voice_for_transcription(adapter, monkeypatch):
+    adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group"),
+        raw_message=message,
+        text=message.text,
+        message_type=message_type,
+        media_urls=[],
+        media_types=[],
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._bot.get_file = AsyncMock(
+        return_value=SimpleNamespace(
+            download_as_bytearray=AsyncMock(return_value=bytearray(b"OggSvoice"))
+        )
+    )
+    cache_media = MagicMock(
+        return_value=SimpleNamespace(
+            path="/tmp/guest-reply.ogg",
+            media_type="audio/ogg",
+            kind="audio",
+            display_name="voice.ogg",
+        )
+    )
+    monkeypatch.setattr("gateway.platforms.base.cache_media_bytes", cache_media)
+    update = SimpleNamespace(
+        update_id=79,
+        api_kwargs={
+            "guest_message": {
+                "message_id": 11,
+                "date": 0,
+                "chat": {"id": 999, "type": "group", "title": "Guest group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+                "text": "@aster ouve isso",
+                "guest_query_id": "query-79",
+                "reply_to_message": {
+                    "message_id": 10,
+                    "date": 0,
+                    "chat": {"id": 999, "type": "group", "title": "Guest group"},
+                    "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+                    "voice": {
+                        "file_id": "voice-file-id",
+                        "file_unique_id": "voice-unique-id",
+                        "duration": 3,
+                        "file_size": 9,
+                    },
+                },
+            }
+        },
+    )
+
+    await adapter._handle_guest_update(update, None)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == telegram_base.MessageType.VOICE
+    assert event.media_urls == ["/tmp/guest-reply.ogg"]
+    assert event.media_types == ["audio/ogg"]
+    assert adapter._bot.get_file.await_args.kwargs["file_id"] == "voice-file-id"
+    cache_media.assert_called_once_with(
+        b"OggSvoice",
+        filename="voice.ogg",
+        mime_type="audio/ogg",
+        default_kind="audio",
+    )
+
+
+@pytest.mark.asyncio
+async def test_guest_update_accepts_direct_voice_with_caption(adapter, monkeypatch):
+    adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group"),
+        raw_message=message,
+        text=message.text or "",
+        message_type=message_type,
+        media_urls=[],
+        media_types=[],
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._bot.get_file = AsyncMock(
+        return_value=SimpleNamespace(
+            download_as_bytearray=AsyncMock(return_value=bytearray(b"OggSdirect")),
+            file_path="voice.ogg",
+        )
+    )
+    cache_media = MagicMock(
+        return_value=SimpleNamespace(
+            path="/tmp/guest-direct.ogg",
+            media_type="audio/ogg",
+            kind="audio",
+            display_name="voice.ogg",
+            context_note=lambda: "[Audio saved]",
+        )
+    )
+    monkeypatch.setattr("gateway.platforms.base.cache_media_bytes", cache_media)
+    update = SimpleNamespace(
+        update_id=80,
+        api_kwargs={
+            "guest_message": {
+                "message_id": 12,
+                "date": 0,
+                "chat": {"id": 999, "type": "group", "title": "Guest group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+                "caption": "@aster ouve isso",
+                "guest_query_id": "query-80",
+                "voice": {
+                    "file_id": "direct-voice-file-id",
+                    "file_unique_id": "direct-voice-unique-id",
+                    "duration": 3,
+                    "file_size": 10,
+                },
+            }
+        },
+    )
+
+    await adapter._handle_guest_update(update, None)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text.startswith("@aster ouve isso")
+    assert event.message_type == telegram_base.MessageType.VOICE
+    assert event.media_urls == ["/tmp/guest-direct.ogg"]
+    assert event.media_types == ["audio/ogg"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["photo", "video", "audio", "voice", "document"])
+async def test_guest_reply_registry_routes_supported_file_media(adapter, field):
+    reply = SimpleNamespace(
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=None,
+        sticker=None,
+        location=None,
+        venue=None,
+    )
+    setattr(reply, field, [object()] if field == "photo" else object())
+    message = SimpleNamespace(reply_to_message=reply)
+    event = SimpleNamespace(
+        text="@aster olha isso",
+        message_type=telegram_base.MessageType.TEXT,
+        media_urls=[],
+        media_types=[],
+    )
+
+    async def cache_replied_media(_message, target_event):
+        target_event.media_urls.append("/tmp/replied-media")
+        target_event.media_types.append("audio/ogg" if field == "voice" else "application/test")
+
+    adapter._cache_replied_media = AsyncMock(side_effect=cache_replied_media)
+
+    await adapter._enrich_guest_reply(message, event)
+
+    adapter._cache_replied_media.assert_awaited_once_with(message, event)
+    if field == "voice":
+        assert event.message_type == telegram_base.MessageType.VOICE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice_cached", [False, True])
+async def test_replied_voice_does_not_reclassify_existing_photo(adapter, voice_cached):
+    reply = SimpleNamespace(voice=object())
+    message = SimpleNamespace(reply_to_message=reply)
+    event = SimpleNamespace(
+        text="@aster olha e ouve",
+        message_type=telegram_base.MessageType.PHOTO,
+        media_urls=["/tmp/direct-photo.jpg"],
+        media_types=["image/jpeg"],
+    )
+
+    async def cache_replied_media(_message, target_event):
+        if voice_cached:
+            target_event.media_urls.append("/tmp/replied-voice.ogg")
+            target_event.media_types.append("audio/ogg")
+
+    adapter._cache_replied_media = AsyncMock(side_effect=cache_replied_media)
+
+    await adapter._enrich_guest_reply_media(message, reply, event)
+
+    assert event.message_type == telegram_base.MessageType.PHOTO
+    assert event.media_types == (
+        ["image/jpeg", "audio/ogg"] if voice_cached else ["image/jpeg"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_replied_photo_makes_direct_voice_event_mime_routed(adapter):
+    reply = SimpleNamespace(voice=None, photo=[object()])
+    message = SimpleNamespace(reply_to_message=reply)
+    event = SimpleNamespace(
+        text="@aster ouve e olha",
+        message_type=telegram_base.MessageType.VOICE,
+        media_urls=["/tmp/direct-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    async def cache_replied_media(_message, target_event):
+        target_event.media_urls.append("/tmp/replied-photo.jpg")
+        target_event.media_types.append("image/jpeg")
+
+    adapter._cache_replied_media = AsyncMock(side_effect=cache_replied_media)
+
+    await adapter._enrich_guest_reply_media(message, reply, event)
+
+    assert event.message_type == telegram_base.MessageType.TEXT
+    assert event.media_types == ["audio/ogg", "image/jpeg"]
+
+
+@pytest.mark.asyncio
+async def test_guest_reply_registry_appends_location_context(adapter):
+    reply = SimpleNamespace(
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=None,
+        sticker=None,
+        location=SimpleNamespace(latitude=40.4168, longitude=-3.7038),
+        venue=None,
+    )
+    message = SimpleNamespace(reply_to_message=reply)
+    event = SimpleNamespace(
+        text="@aster o que tem perto?",
+        message_type=telegram_base.MessageType.TEXT,
+        media_urls=[],
+        media_types=[],
+    )
+
+    await adapter._enrich_guest_reply(message, event)
+
+    assert event.message_type == telegram_base.MessageType.LOCATION
+    assert "@aster o que tem perto?" in event.text
+    assert "latitude: 40.4168" in event.text
+    assert "longitude: -3.7038" in event.text
+
+
+@pytest.mark.asyncio
+async def test_guest_reply_registry_appends_sticker_description(adapter):
+    reply = SimpleNamespace(
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=None,
+        sticker=object(),
+        location=None,
+        venue=None,
+    )
+    message = SimpleNamespace(reply_to_message=reply)
+    event = SimpleNamespace(
+        text="@aster reage",
+        message_type=telegram_base.MessageType.TEXT,
+        media_urls=[],
+        media_types=[],
+    )
+
+    async def describe_sticker(_reply, target_event):
+        target_event.text = "[Sticker: dramatic cat]"
+
+    adapter._handle_sticker = AsyncMock(side_effect=describe_sticker)
+
+    await adapter._enrich_guest_reply(message, event)
+
+    adapter._handle_sticker.assert_awaited_once_with(reply, event)
+    assert event.message_type == telegram_base.MessageType.STICKER
+    assert event.text == "@aster reage\n\n[Sticker: dramatic cat]"
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,15 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
     MAX_RETAINED_QUERIES = 1024
     ANSWER_ATTEMPT_RETENTION_SECONDS = 24 * 60 * 60
     GUEST_STREAM_CONSUMER_LIMIT = 2_147_483_647
+    GUEST_CONTENT_ENRICHERS = (
+        (
+            ("photo", "video", "audio", "voice", "document"),
+            "_enrich_guest_direct_media",
+            "_enrich_guest_reply_media",
+        ),
+        (("location", "venue"), "_enrich_guest_location", "_enrich_guest_location"),
+        (("sticker",), "_enrich_guest_sticker", "_enrich_guest_sticker"),
+    )
 
     def __init__(self, config):
         super().__init__(config)
@@ -153,6 +162,121 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
         return False
 
+    async def _enrich_guest_reply_media(
+        self,
+        message: Message,
+        replied: Message,
+        event: Any,
+    ) -> None:
+        """Reuse Hermes' generic replied-media cache for Guest messages."""
+        media_count_before = len(event.media_urls)
+        await self._cache_replied_media(message, event)
+        if (
+            getattr(replied, "voice", None) is not None
+            and media_count_before == 0
+            and len(event.media_urls) == 1
+            and len(event.media_types) == 1
+            and event.media_types[0].startswith("audio/")
+        ):
+            # The bundled generic cache classifies all audio as AUDIO. Preserve
+            # a standalone voice note as VOICE so the gateway sends it through
+            # STT. Mixed events keep their primary type; the per-item audio MIME
+            # still routes only the voice attachment through transcription.
+            event.message_type = telegram_base.MessageType.VOICE
+
+        if (
+            event.message_type == telegram_base.MessageType.VOICE
+            and any(
+                not media_type.startswith("audio/")
+                for media_type in event.media_types
+            )
+        ):
+            # VOICE is a whole-event fallback in Hermes' STT router. Once an
+            # event mixes audio with another MIME, use TEXT as the neutral type
+            # so each attachment follows its own MIME-specific pipeline.
+            event.message_type = telegram_base.MessageType.TEXT
+
+    async def _enrich_guest_direct_media(
+        self,
+        message: Message,
+        content: Message,
+        event: Any,
+    ) -> None:
+        """Cache media carried directly by the Guest query."""
+        await self._cache_observed_media(content, event)
+        if getattr(content, "voice", None) is not None and event.media_urls:
+            event.message_type = telegram_base.MessageType.VOICE
+
+    async def _enrich_guest_location(
+        self,
+        message: Message,
+        content: Message,
+        event: Any,
+    ) -> None:
+        """Append a direct or quoted location as agent-readable context."""
+        venue = getattr(content, "venue", None)
+        location = (
+            getattr(venue, "location", None)
+            if venue is not None
+            else getattr(content, "location", None)
+        )
+        lat = getattr(location, "latitude", None)
+        lon = getattr(location, "longitude", None)
+        if lat is None or lon is None:
+            return
+
+        label = "Replied-to Telegram location pin" if content is not message else "Telegram location pin"
+        parts = [f"[{label}]"]
+        title = getattr(venue, "title", None) if venue is not None else None
+        address = getattr(venue, "address", None) if venue is not None else None
+        if title:
+            parts.append(f"Venue: {title}")
+        if address:
+            parts.append(f"Address: {address}")
+        parts.extend(
+            (
+                f"latitude: {lat}",
+                f"longitude: {lon}",
+                f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}",
+            )
+        )
+        event.text = self._append_observed_note(event.text, "\n".join(parts))
+        event.message_type = telegram_base.MessageType.LOCATION
+
+    async def _enrich_guest_sticker(
+        self,
+        message: Message,
+        content: Message,
+        event: Any,
+    ) -> None:
+        """Describe a direct or quoted sticker while preserving prompt text."""
+        prompt = event.text
+        await self._handle_sticker(content, event)
+        event.text = self._append_observed_note(prompt, event.text)
+        event.message_type = telegram_base.MessageType.STICKER
+
+    @classmethod
+    def _guest_content_enricher(cls, content: Message, handler_index: int) -> str | None:
+        for fields, direct_handler, reply_handler in cls.GUEST_CONTENT_ENRICHERS:
+            if any(getattr(content, field, None) is not None for field in fields):
+                return (direct_handler, reply_handler)[handler_index]
+        return None
+
+    async def _enrich_guest_direct(self, message: Message, event: Any) -> None:
+        handler_name = self._guest_content_enricher(message, 0)
+        if handler_name is not None:
+            await getattr(self, handler_name)(message, message, event)
+
+    async def _enrich_guest_reply(self, message: Message, event: Any) -> None:
+        """Dispatch quoted Guest content through the matching Hermes enricher."""
+        replied = getattr(message, "reply_to_message", None)
+        if replied is None:
+            return
+
+        handler_name = self._guest_content_enricher(replied, 1)
+        if handler_name is not None:
+            await getattr(self, handler_name)(message, replied, event)
+
     async def _handle_guest_update(self, update: Update, context) -> None:
         raw = (getattr(update, "api_kwargs", None) or {}).get(GUEST_UPDATE_TYPE)
         if not isinstance(raw, dict):
@@ -165,7 +289,10 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         except Exception:
             logger.warning("[Telegram Guest] Invalid guest_message payload", exc_info=True)
             return
-        if not message or not getattr(message, "text", None):
+        if not message:
+            return
+        prompt = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        if not prompt and self._guest_content_enricher(message, 0) is None:
             return
         if not self._guest_caller_authorized(message):
             logger.warning(
@@ -180,8 +307,11 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             telegram_base.MessageType.TEXT,
             update_id=getattr(update, "update_id", None),
         )
+        event.text = prompt
         event.source.chat_id = synthetic_chat_id
         event.source.chat_type = "guest"
+        await self._enrich_guest_direct(message, event)
+        await self._enrich_guest_reply(message, event)
         self._remember_guest_query(synthetic_chat_id, query_id)
         await self.handle_message(event)
 
