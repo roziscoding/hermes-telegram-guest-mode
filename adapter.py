@@ -13,7 +13,7 @@ from gateway.platforms.base import SendResult
 from plugins.platforms.telegram import adapter as telegram_base
 from telegram import InlineQueryResultArticle, InputTextMessageContent, Message, Update
 from telegram.error import BadRequest
-from telegram.ext import TypeHandler
+from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 GUEST_UPDATE_TYPE = "guest_message"
 GUEST_CHAT_PREFIX = "guest:"
@@ -110,7 +110,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         if app_id in installed:
             return True
         try:
-            app.add_handler(TypeHandler(Update, self._handle_guest_update), group=-100)
+            app.add_handler(TypeHandler(Update, self._handle_guest_update_and_stop), group=-100)
         except Exception:
             logger.warning(
                 "[Telegram Guest] Could not install guest handler; normal Telegram remains active",
@@ -279,15 +279,19 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
     async def _handle_guest_update(self, update: Update, context) -> None:
         raw = (getattr(update, "api_kwargs", None) or {}).get(GUEST_UPDATE_TYPE)
-        if not isinstance(raw, dict):
+        message = getattr(update, "guest_message", None)
+        if message is not None:
+            query_id = str(getattr(message, "guest_query_id", "") or "").strip()
+        elif isinstance(raw, dict):
+            query_id = str(raw.get("guest_query_id") or "").strip()
+            try:
+                message = Message.de_json(raw, self._bot)
+            except Exception:
+                logger.warning("[Telegram Guest] Invalid guest_message payload", exc_info=True)
+                return
+        else:
             return
-        query_id = str(raw.get("guest_query_id") or "").strip()
         if not query_id:
-            return
-        try:
-            message = Message.de_json(raw, self._bot)
-        except Exception:
-            logger.warning("[Telegram Guest] Invalid guest_message payload", exc_info=True)
             return
         if not message:
             return
@@ -314,6 +318,14 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         await self._enrich_guest_reply(message, event)
         self._remember_guest_query(synthetic_chat_id, query_id)
         await self.handle_message(event)
+
+    async def _handle_guest_update_and_stop(self, update: Update, context) -> None:
+        """Handle Guest updates exclusively so normal message handlers cannot double-process them."""
+        raw = (getattr(update, "api_kwargs", None) or {}).get(GUEST_UPDATE_TYPE)
+        if getattr(update, "guest_message", None) is None and not isinstance(raw, dict):
+            return
+        await self._handle_guest_update(update, context)
+        raise ApplicationHandlerStop
 
     async def _start_polling_once(self, app, **kwargs):
         self._ensure_guest_handler(app)

@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from telegram import Update
 from telegram.error import BadRequest
+from telegram.ext import ApplicationHandlerStop
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 for path in (PLUGIN_DIR,):
@@ -1052,6 +1054,38 @@ async def test_guest_update_is_dispatched_on_synthetic_chat(adapter, monkeypatch
     assert event.source.chat_type == "guest"
     assert event.text == "@aster oi"
     assert adapter._guest_queries["guest:query-77"].query_id == "query-77"
+
+
+@pytest.mark.asyncio
+async def test_native_ptb_guest_update_is_dispatched_and_stops_normal_handlers(adapter):
+    adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group"),
+        raw_message=message,
+        text=message.text,
+    )
+    adapter.handle_message = AsyncMock()
+    update = Update.de_json(
+        {
+            "update_id": 81,
+            "guest_message": {
+                "message_id": 13,
+                "date": 0,
+                "chat": {"id": 999, "type": "group", "title": "Guest group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+                "text": "@aster ping",
+                "guest_query_id": "query-81",
+            },
+        }
+    )
+
+    with pytest.raises(ApplicationHandlerStop):
+        await adapter._handle_guest_update_and_stop(update, None)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "guest:query-81"
+    assert adapter._guest_queries["guest:query-81"].query_id == "query-81"
 
 
 @pytest.mark.asyncio
