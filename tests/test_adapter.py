@@ -768,7 +768,7 @@ async def test_stream_consumer_edit_failure_retries_complete_replacement(adapter
 
 
 @pytest.mark.asyncio
-async def test_stream_consumer_without_turn_metadata_stays_legacy(adapter):
+async def test_stream_consumer_propagates_turn_final_metadata_for_rich_upgrade(adapter):
     chat_id = guest_chat_id("query-rich-boundary")
     adapter._remember_guest_query(chat_id, "query-rich-boundary")
     pre_tool = "| Step | State |\n| --- | --- |\n| lookup | pending |"
@@ -778,6 +778,8 @@ async def test_stream_consumer_without_turn_metadata_stays_legacy(adapter):
         chat_id,
         StreamConsumerConfig(cursor="", transport="edit", edit_interval=0.01),
     )
+    edit_spy = AsyncMock(wraps=adapter.edit_message)
+    adapter.edit_message = edit_spy
 
     run_task = asyncio.create_task(consumer.run())
     for _ in range(3):
@@ -791,11 +793,47 @@ async def test_stream_consumer_without_turn_metadata_stays_legacy(adapter):
     consumer.finish()
     await asyncio.wait_for(run_task, timeout=2)
 
-    adapter._bot.do_api_request.assert_not_awaited()
+    last_edit = edit_spy.await_args_list[-1].kwargs
+    assert last_edit["finalize"] is True
+    assert last_edit["metadata"]["is_turn_final"] is True
+    assert adapter._rich_eligible(final) is True
+    adapter._bot.do_api_request.assert_awaited_once_with(
+        "editMessageText",
+        api_kwargs={
+            "inline_message_id": "guest-inline-1",
+            "rich_message": adapter._rich_message_payload(final),
+        },
+    )
     assert adapter._guest_queries[chat_id].delivered_content == final
-    method, payload = adapter._bot._post.await_args.args
-    assert method == "editMessageText"
-    assert payload["parse_mode"] == telegram_base.ParseMode.MARKDOWN_V2
+
+
+@pytest.mark.asyncio
+async def test_turn_final_compat_patch_leaves_normal_consumer_metadata_unchanged():
+    normal_adapter = SimpleNamespace(
+        edit_message=AsyncMock(return_value=SendResult(success=True)),
+    )
+    metadata = {"expect_edits": True}
+    consumer = GatewayStreamConsumer(
+        normal_adapter,
+        "16715013",
+        StreamConsumerConfig(cursor="", transport="edit"),
+        metadata=metadata,
+    )
+
+    result = await consumer._edit_message(
+        message_id="normal-message",
+        content="Normal Telegram",
+        finalize=True,
+    )
+
+    assert result.success is True
+    normal_adapter.edit_message.assert_awaited_once_with(
+        chat_id="16715013",
+        message_id="normal-message",
+        content="Normal Telegram",
+        finalize=True,
+        metadata=metadata,
+    )
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import time
@@ -48,6 +49,7 @@ class GuestQueryState:
     latest_content: str = ""
     delivered_content: str = ""
     delivered_finalized: bool = False
+    delivered_rich_finalized: bool = False
     rich_edit_ambiguous: bool = False
     rich_rejected_content: str = ""
     answer_attempted: bool = False
@@ -512,6 +514,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 state.answered
                 and state.delivered_finalized
                 and rich_text == state.delivered_content
+                and (state.delivered_rich_finalized or not rich_eligible)
             ):
                 return SendResult(
                     success=True,
@@ -542,6 +545,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                         state.rich_rejected_content = ""
                         state.delivered_content = rich_text
                         state.delivered_finalized = True
+                        state.delivered_rich_finalized = True
                         state.placeholder_active = False
                         return SendResult(
                             success=True,
@@ -583,12 +587,14 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                             payload,
                         )
                         state.delivered_finalized = finalize
+                        state.delivered_rich_finalized = False
                     except Exception as format_exc:
                         if not finalize or not isinstance(format_exc, BadRequest):
                             raise
                         if "not modified" in str(format_exc).lower():
                             raw_response = True
                             state.delivered_finalized = True
+                            state.delivered_rich_finalized = False
                         else:
                             logger.warning(
                                 "[Telegram Guest] MarkdownV2 edit failed for query=%s; "
@@ -609,6 +615,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                                     raise
                                 raw_response = True
                             state.delivered_finalized = True
+                            state.delivered_rich_finalized = False
                 except Exception as exc:
                     raise GuestEditError(
                         telegram_base._redact_telegram_error_text(exc)
@@ -676,6 +683,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             state.inline_message_id = str(inline_message_id) if inline_message_id else None
             state.delivered_content = text
             state.delivered_finalized = False
+            state.delivered_rich_finalized = False
             logger.info(
                 "[Telegram Guest] Answered query=%s chars=%d inline_id=%s result_type=%s",
                 query_ref,
@@ -783,6 +791,120 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
 def _build_adapter(config):
     return GuestTelegramAdapter(config)
+
+
+def _patch_stream_consumer_turn_final_metadata() -> None:
+    """Bridge explicit turn finality on Hermes cores that drop it before edits.
+
+    Current StreamConsumer builds know whether a finalized frame ends the whole
+    turn, but their private ``_edit_message`` helper forwards only static
+    metadata. Guest rich content must never infer finality from ``finalize``
+    alone because segment, split, and cancellation boundaries also finalize.
+    """
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+    except Exception:
+        return
+
+    current_send_or_edit = getattr(GatewayStreamConsumer, "_send_or_edit", None)
+    current_edit_message = getattr(GatewayStreamConsumer, "_edit_message", None)
+    if not callable(current_send_or_edit) or not callable(current_edit_message):
+        return
+    if getattr(current_send_or_edit, "_telegram_guest_turn_final_patch", False):
+        return
+
+    try:
+        send_params = inspect.signature(current_send_or_edit).parameters
+        edit_params = inspect.signature(current_edit_message).parameters
+    except (TypeError, ValueError):
+        return
+    # A newer core owns this contract itself; never stack a compatibility shim.
+    if "is_turn_final" in edit_params:
+        return
+    # Older cores that do not expose the lifecycle fact cannot be patched safely.
+    if "is_turn_final" not in send_params:
+        return
+
+    turn_final_attr = "_telegram_guest_current_turn_final"
+    missing = object()
+
+    async def _send_or_edit(
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        is_turn_final: bool = True,
+    ) -> bool:
+        if not is_guest_chat_id(getattr(self, "chat_id", "")):
+            return await current_send_or_edit(
+                self,
+                text,
+                finalize=finalize,
+                is_turn_final=is_turn_final,
+            )
+        previous = getattr(self, turn_final_attr, missing)
+        setattr(self, turn_final_attr, bool(is_turn_final))
+        try:
+            return await current_send_or_edit(
+                self,
+                text,
+                finalize=finalize,
+                is_turn_final=is_turn_final,
+            )
+        finally:
+            if previous is missing:
+                try:
+                    delattr(self, turn_final_attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(self, turn_final_attr, previous)
+
+    async def _edit_message(
+        self,
+        *,
+        message_id: str,
+        content: str,
+        finalize: bool = False,
+    ):
+        if not is_guest_chat_id(getattr(self, "chat_id", "")):
+            return await current_edit_message(
+                self,
+                message_id=message_id,
+                content=content,
+                finalize=finalize,
+            )
+
+        kwargs = {
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "content": content,
+            "finalize": finalize,
+        }
+        metadata = dict(self.metadata) if self.metadata else {}
+        if finalize:
+            metadata["is_turn_final"] = bool(
+                getattr(self, turn_final_attr, False)
+            )
+        if metadata:
+            try:
+                params = inspect.signature(self.adapter.edit_message).parameters
+                if "metadata" in params or any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                ):
+                    kwargs["metadata"] = metadata
+            except (TypeError, ValueError):
+                pass
+        return await self.adapter.edit_message(**kwargs)
+
+    _send_or_edit._telegram_guest_turn_final_patch = True  # type: ignore[attr-defined]
+    _edit_message._telegram_guest_turn_final_patch = True  # type: ignore[attr-defined]
+    GatewayStreamConsumer._send_or_edit = _send_or_edit
+    GatewayStreamConsumer._edit_message = _edit_message
+
+
+_patch_stream_consumer_turn_final_metadata()
 
 
 def register(ctx) -> None:

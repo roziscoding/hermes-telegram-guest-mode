@@ -54,6 +54,7 @@ The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` pl
 - sends the first visible frame with `answerGuestQuery`, preserves the returned
   `inline_message_id`, and updates that same response with `editMessageText`;
 - keeps streaming previews on the tolerant plain-text path, then upgrades eligible final responses (tables, task lists, details, and block math) to Bot API rich messages in place;
+- bridges `is_turn_final` through older Hermes StreamConsumer edit paths so rich promotion happens only for the completed turn, never for tool/segment, split, or cancellation boundaries;
 - falls back from a permanently rejected rich final to MarkdownV2, and from rejected MarkdownV2 to plain text, without duplicating ambiguous edits;
 - suppresses internal lifecycle/status bubbles and prevents auxiliary footer sends from replacing a completed Guest response;
 - retains the complete pending replacement after an edit failure so Hermes can retry without replacing the response with a continuation-only tail;
@@ -68,7 +69,7 @@ If the guest handler cannot be installed, ordinary Telegram startup continues. A
 - Telegram permits one initial guest response. The plugin uses inline-message edits to update that response during streaming and after tool calls; it cannot send a second independent guest message. After any failed or ambiguous `answerGuestQuery` attempt, it fails closed instead of risking a second initial response. Attempted query IDs remain in a separate 24-hour process-local replay guard even if detailed query state is evicted.
 - Interactive polls/clarification prompts and multiple assistant messages cannot be delivered through a guest query.
 - Initial and legacy Guest text is capped at Telegram's 4,096 UTF-16-unit limit. Eligible streamed responses can upgrade in place to a final rich message up to Telegram's 32,768-character rich limit.
-- Rich final promotion requires a Hermes core that supplies explicit `is_turn_final` stream metadata; cores that do not propagate it safely remain on the legacy MarkdownV2/plain path.
+- Rich final promotion requires a Hermes core whose StreamConsumer knows explicit `is_turn_final`. The plugin safely bridges builds that expose the signal on `_send_or_edit` but drop it before adapter edits; older builds with no signal remain on the conservative MarkdownV2/plain path, and newer cores with native propagation skip the shim.
 - The plugin depends on private Hermes adapter methods and may need updates when Hermes changes them.
 
 ## Troubleshooting
