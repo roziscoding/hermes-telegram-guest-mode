@@ -976,6 +976,21 @@ def test_guest_authorization_uses_gateway_pairing_policy(adapter):
     assert calls == [("42", "dm", "42")]
 
 
+def test_guest_authorization_prefers_sender_chat_over_telegram_fake_user(adapter):
+    adapter.config = SimpleNamespace(
+        extra={"group_allow_from": ["-1002069097091"]},
+        home_channel=None,
+    )
+    adapter._authorization_check = lambda *args: False
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=136817688, is_bot=True),
+        sender_chat=SimpleNamespace(id=-1002069097091, title="Roz's channel"),
+        chat=SimpleNamespace(id=-1009999999999, type="supergroup"),
+    )
+
+    assert adapter._guest_caller_authorized(message) is True
+
+
 def test_explicit_guest_allowlist_remains_authoritative(adapter, monkeypatch):
     adapter.config = SimpleNamespace(extra={"allow_from": ["7"]}, home_channel=None)
     adapter._authorization_check = lambda *args: True
@@ -1054,6 +1069,100 @@ async def test_guest_update_is_dispatched_on_synthetic_chat(adapter, monkeypatch
     assert event.source.chat_type == "guest"
     assert event.text == "@aster oi"
     assert adapter._guest_queries["guest:query-77"].query_id == "query-77"
+
+
+@pytest.mark.asyncio
+async def test_guest_update_publishes_thinking_then_first_token_replaces_it(adapter):
+    adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group"),
+        raw_message=message,
+        text=message.text,
+    )
+
+    async def handle_message(event):
+        answer_call = adapter._bot._post.await_args_list[0]
+        assert answer_call.args[0] == "answerGuestQuery"
+        thinking_result = answer_call.args[1]["result"]
+        assert thinking_result.input_message_content.message_text == "✨ Thinking"
+        await adapter.send(
+            event.source.chat_id,
+            "O",
+            metadata={},
+        )
+
+    adapter.handle_message = handle_message
+    update = SimpleNamespace(
+        update_id=78,
+        api_kwargs={
+            "guest_message": {
+                "message_id": 10,
+                "date": 0,
+                "chat": {"id": 999, "type": "group", "title": "Guest group"},
+                "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+                "text": "@aster oi",
+                "guest_query_id": "query-78",
+            }
+        },
+    )
+
+    await adapter._handle_guest_update(update, None)
+
+    assert [call.args[0] for call in adapter._bot._post.await_args_list] == [
+        "answerGuestQuery",
+        "editMessageText",
+    ]
+    edit_payload = adapter._bot._post.await_args_list[1].args[1]
+    assert edit_payload["text"] == "O"
+    assert adapter._guest_queries["guest:query-78"].delivered_content == "O"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_guest_update_does_not_restore_thinking_or_redispatch(adapter):
+    adapter.config = SimpleNamespace(extra={"allow_from": ["42"]})
+    adapter._build_message_event = lambda message, message_type, update_id=None: SimpleNamespace(
+        source=SimpleNamespace(chat_id="999", chat_type="group"),
+        raw_message=message,
+        text=message.text,
+    )
+    dispatches = 0
+
+    async def handle_message(event):
+        nonlocal dispatches
+        dispatches += 1
+        await adapter.send(
+            event.source.chat_id,
+            "Resposta final",
+            metadata={"expect_edits": True},
+        )
+
+    adapter.handle_message = handle_message
+    raw_guest = {
+        "message_id": 11,
+        "date": 0,
+        "chat": {"id": 999, "type": "group", "title": "Guest group"},
+        "from": {"id": 42, "is_bot": False, "first_name": "Roz"},
+        "text": "@aster oi",
+        "guest_query_id": "query-duplicate",
+    }
+
+    await adapter._handle_guest_update(
+        SimpleNamespace(update_id=79, api_kwargs={"guest_message": raw_guest}),
+        None,
+    )
+    await adapter._handle_guest_update(
+        SimpleNamespace(update_id=80, api_kwargs={"guest_message": raw_guest}),
+        None,
+    )
+
+    assert dispatches == 1
+    assert [call.args[0] for call in adapter._bot._post.await_args_list] == [
+        "answerGuestQuery",
+        "editMessageText",
+    ]
+    assert adapter._guest_queries["guest:query-duplicate"].delivered_content == (
+        "Resposta final"
+    )
 
 
 @pytest.mark.asyncio

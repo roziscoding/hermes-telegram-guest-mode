@@ -46,6 +46,7 @@ class GuestQueryState:
     answer_error: str | None = None
     answered: bool = False
     inline_message_id: str | None = None
+    placeholder_active: bool = False
     answer_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -121,10 +122,10 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         return True
 
     @staticmethod
-    def _configured_guest_user_ids(config) -> set[str]:
+    def _configured_guest_ids(config, key: str) -> set[str]:
         values: list[Any] = []
         extra = getattr(config, "extra", {}) or {}
-        configured = extra.get("allow_from")
+        configured = extra.get(key)
         if isinstance(configured, (list, tuple, set)):
             values.extend(configured)
         elif configured:
@@ -132,27 +133,46 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
         return {str(value).strip() for value in values if str(value).strip()}
 
+    @classmethod
+    def _configured_guest_user_ids(cls, config) -> set[str]:
+        return cls._configured_guest_ids(config, "allow_from")
+
     def _guest_caller_authorized(self, message: Message) -> bool:
+        sender_chat = getattr(message, "sender_chat", None)
+        sender_chat_id = str(getattr(sender_chat, "id", "") or "").strip()
         user = getattr(message, "from_user", None)
         user_id = str(getattr(user, "id", "") or "").strip()
-        if not user_id:
+
+        if sender_chat_id:
+            caller_id = sender_chat_id
+            chat_type = "group"
+            chat = getattr(message, "chat", None)
+            chat_id = str(getattr(chat, "id", "") or caller_id).strip()
+            allowlist_key = "group_allow_from"
+        elif user_id:
+            caller_id = user_id
+            chat_type = "dm"
+            chat_id = user_id
+            allowlist_key = "allow_from"
+        else:
             return False
 
-        # An explicit adapter allowlist is authoritative, matching Hermes' DM
-        # authorization semantics. Guest queries are authorized as the caller,
-        # not as the external chat where the bot is only temporarily mentioned.
+        # An explicit scope-specific allowlist is authoritative. Channel-profile
+        # Guest messages carry Telegram's fake Channel_Bot in from_user, so use
+        # sender_chat as the caller and the group-only allowlist when available.
         extra = getattr(self.config, "extra", {}) or {}
-        if extra.get("allow_from") is not None:
-            allowed = self._configured_guest_user_ids(self.config)
-            return user_id in allowed or "*" in allowed
+        configured_key = allowlist_key
+        if extra.get(configured_key) is None and sender_chat_id:
+            configured_key = "allow_from"
+        if extra.get(configured_key) is not None:
+            allowed = self._configured_guest_ids(self.config, configured_key)
+            return caller_id in allowed or "*" in allowed
 
         # Use the profile-scoped authorization callback injected by GatewayRunner.
-        # Guest queries are authorized as a DM from the caller, not as the external
-        # chat where the bot is only temporarily mentioned.
         auth_check = getattr(self, "_authorization_check", None)
         if callable(auth_check):
             try:
-                return bool(auth_check(user_id, "dm", user_id))
+                return bool(auth_check(caller_id, chat_type, chat_id))
             except Exception:
                 logger.warning(
                     "[Telegram Guest] Central caller authorization failed; denying request",
@@ -299,13 +319,33 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         if not prompt and self._guest_content_enricher(message, 0) is None:
             return
         if not self._guest_caller_authorized(message):
+            sender_chat = getattr(message, "sender_chat", None)
+            caller = sender_chat or getattr(message, "from_user", None)
             logger.warning(
                 "[Telegram Guest] Blocked unauthorized caller %s",
-                getattr(getattr(message, "from_user", None), "id", None),
+                getattr(caller, "id", None),
             )
             return
 
         synthetic_chat_id = guest_chat_id(query_id)
+        state = self._remember_guest_query(synthetic_chat_id, query_id)
+        if state.answer_attempted:
+            logger.info(
+                "[Telegram Guest] Ignoring duplicate query=%s",
+                hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
+            )
+            return
+        state.placeholder_active = True
+        thinking = await self._publish_guest(synthetic_chat_id, "✨ Thinking")
+        if not thinking.success:
+            state.placeholder_active = False
+            logger.warning(
+                "[Telegram Guest] Could not publish initial thinking response query=%s: %s",
+                hashlib.sha256(query_id.encode("utf-8")).hexdigest()[:8],
+                thinking.error or "unknown error",
+            )
+            return
+
         event = self._build_message_event(
             message,
             telegram_base.MessageType.TEXT,
@@ -316,7 +356,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         event.source.chat_type = "guest"
         await self._enrich_guest_direct(message, event)
         await self._enrich_guest_reply(message, event)
-        self._remember_guest_query(synthetic_chat_id, query_id)
         await self.handle_message(event)
 
     async def _handle_guest_update_and_stop(self, update: Update, context) -> None:
@@ -419,7 +458,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return SendResult(success=False, error="Unknown guest query")
         query_ref = hashlib.sha256(state.query_id.encode("utf-8")).hexdigest()[:8]
         async with state.answer_lock:
-            if state.answered and not allow_after_answer:
+            if state.answered and not allow_after_answer and not state.placeholder_active:
                 logger.info(
                     "[Telegram Guest] Suppressed unmarked send after answer query=%s",
                     query_ref,
@@ -494,6 +533,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                         state.rich_rejected_content = ""
                         state.delivered_content = rich_text
                         state.delivered_finalized = True
+                        state.placeholder_active = False
                         return SendResult(
                             success=True,
                             message_id=state.inline_message_id,
@@ -510,6 +550,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                 if text == state.delivered_content and (
                     not finalize or state.delivered_finalized
                 ):
+                    state.placeholder_active = False
                     return SendResult(
                         success=True,
                         message_id=state.inline_message_id,
@@ -564,6 +605,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                         telegram_base._redact_telegram_error_text(exc)
                     ) from exc
                 state.delivered_content = text
+                state.placeholder_active = False
                 logger.info(
                     "[Telegram Guest] Edited response query=%s result_type=%s",
                     query_ref,
