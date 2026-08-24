@@ -1,7 +1,7 @@
 name: telegram-guest
 label: Telegram Guest Mode
 kind: standalone
-version: 0.5.2
+version: 0.5.3
 description: >
   Adds native Telegram Guest Mode support by subclassing the bundled
   Telegram adapter. Normal Telegram traffic always uses the upstream paths.

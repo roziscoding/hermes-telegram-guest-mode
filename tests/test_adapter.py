@@ -1101,7 +1101,14 @@ async def test_guest_update_publishes_thinking_then_first_token_replaces_it(adap
         answer_call = adapter._bot._post.await_args_list[0]
         assert answer_call.args[0] == "answerGuestQuery"
         thinking_result = answer_call.args[1]["result"]
-        assert thinking_result.input_message_content.message_text == "✨ Thinking"
+        thinking_content = thinking_result.input_message_content
+        assert thinking_content.message_text == "✨ Thinking"
+        assert len(thinking_content.entities) == 1
+        emoji_entity = thinking_content.entities[0]
+        assert emoji_entity.type == "custom_emoji"
+        assert emoji_entity.offset == 0
+        assert emoji_entity.length == 1
+        assert emoji_entity.custom_emoji_id == "5463297803235113601"
         await adapter.send(
             event.source.chat_id,
             "O",

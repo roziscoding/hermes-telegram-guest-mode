@@ -50,7 +50,7 @@ The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` pl
 - preserves quoted voice notes as `VOICE` events so Hermes sends them through automatic speech-to-text;
 - preserves Hermes' normal inbound message pipeline;
 - authorizes channel-profile invocations through `sender_chat` instead of Telegram's fake `Channel_Bot` user, using an explicit `group_allow_from` override when present and the global `allow_from` list otherwise;
-- immediately publishes `✨ Thinking` after authorization and replaces it in place as soon as the first streamed token arrives;
+- immediately publishes `✨ Thinking` after authorization using Telegram custom emoji `5463297803235113601`, then replaces it in place as soon as the first streamed token arrives;
 - sends the first visible frame with `answerGuestQuery`, preserves the returned
   `inline_message_id`, and updates that same response with `editMessageText`;
 - keeps streaming previews on the tolerant plain-text path, then upgrades eligible final responses (tables, task lists, details, and block math) to Bot API rich messages in place;

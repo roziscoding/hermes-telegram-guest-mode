@@ -11,12 +11,20 @@ from typing import Any
 
 from gateway.platforms.base import SendResult
 from plugins.platforms.telegram import adapter as telegram_base
-from telegram import InlineQueryResultArticle, InputTextMessageContent, Message, Update
+from telegram import (
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    Message,
+    MessageEntity,
+    Update,
+)
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 GUEST_UPDATE_TYPE = "guest_message"
 GUEST_CHAT_PREFIX = "guest:"
+GUEST_THINKING_TEXT = "✨ Thinking"
+GUEST_THINKING_CUSTOM_EMOJI_ID = "5463297803235113601"
 
 logger = logging.getLogger(__name__)
 _UPDATE_TYPES_LOCK = asyncio.Lock()
@@ -337,7 +345,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             )
             return
         state.placeholder_active = True
-        thinking = await self._publish_guest(synthetic_chat_id, "✨ Thinking")
+        thinking = await self._publish_guest(synthetic_chat_id, GUEST_THINKING_TEXT)
         if not thinking.success:
             state.placeholder_active = False
             logger.warning(
@@ -632,7 +640,19 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             result = InlineQueryResultArticle(
                 id=result_id,
                 title=getattr(self._bot, "first_name", None) or "Hermes",
-                input_message_content=InputTextMessageContent(message_text=text),
+                input_message_content=InputTextMessageContent(
+                    message_text=text,
+                    entities=(
+                        MessageEntity(
+                            type=MessageEntity.CUSTOM_EMOJI,
+                            offset=0,
+                            length=1,
+                            custom_emoji_id=GUEST_THINKING_CUSTOM_EMOJI_ID,
+                        ),
+                    )
+                    if state.placeholder_active and text == GUEST_THINKING_TEXT
+                    else (),
+                ),
             )
             try:
                 raw_response = await self._bot._post(
