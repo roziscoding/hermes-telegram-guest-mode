@@ -157,12 +157,16 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         else:
             return False
 
-        # An explicit scope-specific allowlist is authoritative. Channel-profile
-        # Guest messages carry Telegram's fake Channel_Bot in from_user, so use
-        # sender_chat as the caller and the group-only allowlist when available.
+        # Explicit scope-specific policy wins. Channel-profile Guest messages
+        # carry Telegram's fake Channel_Bot in from_user, so authorize the real
+        # sender_chat against group_allow_from when configured; otherwise fall
+        # back to the global allow_from list shared by every Telegram sender.
         extra = getattr(self.config, "extra", {}) or {}
-        if extra.get(allowlist_key) is not None:
-            allowed = self._configured_guest_ids(self.config, allowlist_key)
+        configured_key = allowlist_key
+        if sender_chat_id and extra.get("group_allow_from") is None:
+            configured_key = "allow_from"
+        if extra.get(configured_key) is not None:
+            allowed = self._configured_guest_ids(self.config, configured_key)
             return caller_id in allowed or "*" in allowed
 
         # Use the profile-scoped authorization callback injected by GatewayRunner.
