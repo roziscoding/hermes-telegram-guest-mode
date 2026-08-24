@@ -161,11 +161,8 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         # Guest messages carry Telegram's fake Channel_Bot in from_user, so use
         # sender_chat as the caller and the group-only allowlist when available.
         extra = getattr(self.config, "extra", {}) or {}
-        configured_key = allowlist_key
-        if extra.get(configured_key) is None and sender_chat_id:
-            configured_key = "allow_from"
-        if extra.get(configured_key) is not None:
-            allowed = self._configured_guest_ids(self.config, configured_key)
+        if extra.get(allowlist_key) is not None:
+            allowed = self._configured_guest_ids(self.config, allowlist_key)
             return caller_id in allowed or "*" in allowed
 
         # Use the profile-scoped authorization callback injected by GatewayRunner.

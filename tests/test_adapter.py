@@ -991,6 +991,28 @@ def test_guest_authorization_prefers_sender_chat_over_telegram_fake_user(adapter
     assert adapter._guest_caller_authorized(message) is True
 
 
+def test_sender_chat_without_group_allowlist_defers_to_group_callback(adapter):
+    calls = []
+    adapter.config = SimpleNamespace(
+        extra={"allow_from": ["*"]},
+        home_channel=None,
+    )
+    adapter._authorization_check = (
+        lambda user_id, chat_type, chat_id: calls.append(
+            (user_id, chat_type, chat_id)
+        )
+        or False
+    )
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=136817688, is_bot=True),
+        sender_chat=SimpleNamespace(id=-1002069097091, title="Roz's channel"),
+        chat=SimpleNamespace(id=-1009999999999, type="supergroup"),
+    )
+
+    assert adapter._guest_caller_authorized(message) is False
+    assert calls == [("-1002069097091", "group", "-1009999999999")]
+
+
 def test_explicit_guest_allowlist_remains_authoritative(adapter, monkeypatch):
     adapter.config = SimpleNamespace(extra={"allow_from": ["7"]}, home_channel=None)
     adapter._authorization_check = lambda *args: True
