@@ -4,9 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
-import os
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,7 +26,6 @@ GUEST_THINKING_TEXT = "✨ Thinking"
 GUEST_THINKING_CUSTOM_EMOJI_ID = "5463297803235113601"
 
 logger = logging.getLogger(__name__)
-_UPDATE_TYPES_LOCK = asyncio.Lock()
 
 
 class GuestEditError(RuntimeError):
@@ -82,18 +79,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         self._answer_attempted_query_ids: dict[str, float] = {}
         self._guest_handler_apps: set[int] = set()
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        super().__setattr__(name, value)
-        if name == "_app" and value is not None and hasattr(self, "_guest_handler_apps"):
-            self._ensure_guest_handler(value)
-
-    @staticmethod
-    def with_guest_update_type(update_types: Iterable[str]) -> tuple[str, ...]:
-        result = tuple(update_types)
-        if GUEST_UPDATE_TYPE not in result:
-            result += (GUEST_UPDATE_TYPE,)
-        return result
-
     def _remember_guest_query(self, chat_id: str, query_id: str) -> GuestQueryState:
         now = time.monotonic()
         while self._answer_attempted_query_ids:
@@ -114,6 +99,12 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
 
     def _ensure_guest_handler(self, app) -> bool:
         """Install the catch-all guest handler without risking normal Telegram."""
+        if GUEST_UPDATE_TYPE not in Update.ALL_TYPES:
+            logger.error(
+                "[Telegram Guest] python-telegram-bot 22.8+ is required "
+                "for guest_message"
+            )
+            return False
         installed = getattr(self, "_guest_handler_apps", None)
         if installed is None:
             installed = self._guest_handler_apps = set()
@@ -130,6 +121,11 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return False
         installed.add(app_id)
         return True
+
+    def _register_handlers(self, app) -> None:
+        """Keep Guest wiring on PTB applications rebuilt by older Hermes cores."""
+        self._ensure_guest_handler(app)
+        super()._register_handlers(app)
 
     @staticmethod
     def _configured_guest_ids(config, key: str) -> set[str]:
@@ -377,39 +373,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         await self._handle_guest_update(update, context)
         raise ApplicationHandlerStop
 
-    async def _start_polling_once(self, app, **kwargs):
-        self._ensure_guest_handler(app)
-        async with _UPDATE_TYPES_LOCK:
-            original = Update.ALL_TYPES
-            Update.ALL_TYPES = self.with_guest_update_type(original)
-            try:
-                result = await super()._start_polling_once(app, **kwargs)
-                logger.info(
-                    "[Telegram Guest] Guest handler installed; polling accepts guest_message"
-                )
-                return result
-            finally:
-                Update.ALL_TYPES = original
-
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Enable guest updates around the parent connect; fail open to normal Telegram."""
-        if os.getenv("TELEGRAM_WEBHOOK_URL", "").strip():
-            # Polling is patched in _start_polling_once. Webhook setup consumes
-            # Update.ALL_TYPES directly in connect(), so serialize only that path.
-            async with _UPDATE_TYPES_LOCK:
-                original = Update.ALL_TYPES
-                Update.ALL_TYPES = self.with_guest_update_type(original)
-                try:
-                    connected = await super().connect(is_reconnect=is_reconnect)
-                finally:
-                    Update.ALL_TYPES = original
-        else:
-            connected = await super().connect(is_reconnect=is_reconnect)
-        if connected and getattr(self, "_app", None) is not None:
-            # Polling installs before getUpdates in _start_polling_once. This
-            # second idempotent call covers webhook mode and future parent paths.
-            self._ensure_guest_handler(self._app)
-        return connected
 
     async def _try_edit_guest_rich(
         self,
@@ -907,7 +870,19 @@ def _patch_stream_consumer_turn_final_metadata() -> None:
 _patch_stream_consumer_turn_final_metadata()
 
 
+def _wire_guest_handler(app, adapter) -> None:
+    """Register Guest updates through Hermes' native platform-handler API."""
+    if not isinstance(adapter, GuestTelegramAdapter):
+        logger.warning(
+            "[Telegram Guest] Expected GuestTelegramAdapter, got %s",
+            type(adapter).__name__,
+        )
+        return
+    adapter._ensure_guest_handler(app)
+
+
 def register(ctx) -> None:
+    ctx.register_platform_handler("telegram", _wire_guest_handler)
     ctx.register_platform(
         name="telegram",
         label="Telegram",

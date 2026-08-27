@@ -2,7 +2,7 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
@@ -16,13 +16,16 @@ for path in (PLUGIN_DIR,):
         sys.path.insert(0, str(path))
 
 from gateway.platforms.base import SendResult
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram import adapter as telegram_base
 
 from adapter import (
     GuestEditError,
     GuestTelegramAdapter,
+    _wire_guest_handler,
     guest_chat_id,
     is_guest_chat_id,
+    register,
 )
 
 
@@ -945,47 +948,95 @@ async def test_guest_typing_is_a_noop(adapter):
     adapter._bot._post.assert_not_awaited()
 
 
-def test_allowed_updates_include_guest_message_without_removing_existing_types():
-    original = ("message", "callback_query")
-
-    result = GuestTelegramAdapter.with_guest_update_type(original)
-
-    assert result == ("message", "callback_query", "guest_message")
-    assert GuestTelegramAdapter.with_guest_update_type(result) == result
+def test_ptb_exposes_guest_message_update_type():
+    assert "guest_message" in Update.ALL_TYPES
 
 
-@pytest.mark.asyncio
-async def test_polling_update_type_patch_is_serialized_and_restored(monkeypatch):
-    active = 0
-    max_active = 0
+def test_register_uses_native_platform_handler_extension():
+    ctx = MagicMock()
 
-    async def fake_start(self, app, **kwargs):
-        nonlocal active, max_active
-        assert "guest_message" in telegram_base.Update.ALL_TYPES
-        active += 1
-        max_active = max(max_active, active)
-        await asyncio.sleep(0.01)
-        active -= 1
-        return (1, asyncio.Event())
+    register(ctx)
 
-    monkeypatch.setattr(
-        telegram_base.TelegramAdapter,
-        "_start_polling_once",
-        fake_start,
+    ctx.register_platform_handler.assert_called_once()
+    platform, factory = ctx.register_platform_handler.call_args.args
+    assert platform == "telegram"
+    assert callable(factory)
+    ctx.register_platform.assert_called_once()
+
+
+def test_native_factory_does_not_mutate_ptb_update_types(adapter):
+    app = MagicMock()
+    adapter._guest_handler_apps = set()
+    original_update_types = Update.ALL_TYPES
+    ctx = MagicMock()
+    register(ctx)
+    _, factory = ctx.register_platform_handler.call_args.args
+
+    factory(app, adapter)
+
+    assert Update.ALL_TYPES is original_update_types
+
+
+def test_native_factory_rejects_ptb_without_guest_update(adapter, monkeypatch):
+    app = MagicMock()
+    adapter._guest_handler_apps = set()
+    monkeypatch.setattr(Update, "ALL_TYPES", ["message", "callback_query"])
+    ctx = MagicMock()
+    register(ctx)
+    _, factory = ctx.register_platform_handler.call_args.args
+
+    factory(app, adapter)
+
+    app.add_handler.assert_not_called()
+
+
+def test_core_registration_rejects_ptb_without_guest_update(adapter, monkeypatch):
+    app = MagicMock()
+    adapter._guest_handler_apps = set()
+    monkeypatch.setattr(Update, "ALL_TYPES", ["message", "callback_query"])
+    core_register = MagicMock()
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "_register_handlers", core_register)
+
+    adapter._register_handlers(app)
+
+    app.add_handler.assert_not_called()
+    core_register.assert_called_once_with(app)
+
+
+def test_native_factory_is_idempotent_for_same_application(adapter):
+    calls = []
+    app = SimpleNamespace(add_handler=lambda *args, **kwargs: calls.append((args, kwargs)))
+    adapter._guest_handler_apps = set()
+    ctx = MagicMock()
+    register(ctx)
+    _, factory = ctx.register_platform_handler.call_args.args
+
+    factory(app, adapter)
+    factory(app, adapter)
+
+    assert len(calls) == 1
+
+
+def test_core_platform_hook_wires_guest_handler(adapter):
+    manager = PluginManager()
+    context = PluginContext(
+        manifest=PluginManifest(
+            name="telegram-guest",
+            version="1.0.0",
+            description="test",
+        ),
+        manager=manager,
     )
-    original = telegram_base.Update.ALL_TYPES
-    adapters = [object.__new__(GuestTelegramAdapter) for _ in range(2)]
-    for instance in adapters:
-        instance._guest_handler_apps = set()
-    apps = [SimpleNamespace(add_handler=lambda *args, **kwargs: None) for _ in range(2)]
+    context.register_platform_handler("telegram", _wire_guest_handler)
+    app = MagicMock()
+    adapter.platform = SimpleNamespace(value="telegram")
+    adapter._guest_handler_apps = set()
 
-    await asyncio.gather(
-        adapters[0]._start_polling_once(apps[0]),
-        adapters[1]._start_polling_once(apps[1]),
-    )
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+        adapter._wire_plugin_handlers(app)
 
-    assert max_active == 1
-    assert telegram_base.Update.ALL_TYPES is original
+    app.add_handler.assert_called_once()
+    assert app.add_handler.call_args.kwargs["group"] == -100
 
 
 def test_guest_allowlist_supports_wildcard():
@@ -1076,15 +1127,34 @@ def test_guest_authorization_failure_denies_instead_of_using_environment(adapter
     assert adapter._guest_caller_authorized(message) is False
 
 
-def test_application_assignment_installs_guest_handler_before_transport(adapter):
+def test_native_factory_owns_initial_guest_handler_registration(adapter):
     calls = []
     app = SimpleNamespace(add_handler=lambda *args, **kwargs: calls.append((args, kwargs)))
     adapter._guest_handler_apps = set()
 
     adapter._app = app
+    assert calls == []
+
+    ctx = MagicMock()
+    register(ctx)
+    _, factory = ctx.register_platform_handler.call_args.args
+    factory(app, adapter)
 
     assert len(calls) == 1
     assert calls[0][1]["group"] == -100
+
+
+def test_core_handler_rebuild_restores_guest_handler(adapter, monkeypatch):
+    app = MagicMock()
+    adapter._guest_handler_apps = set()
+    core_register = MagicMock()
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "_register_handlers", core_register)
+
+    adapter._register_handlers(app)
+
+    app.add_handler.assert_called_once()
+    assert app.add_handler.call_args.kwargs["group"] == -100
+    core_register.assert_called_once_with(app)
 
 
 def test_guest_handler_installation_is_fail_closed(adapter):

@@ -1,8 +1,8 @@
 name: telegram-guest
 label: Telegram Guest Mode
 kind: standalone
-version: 0.6.0
+version: 1.0.0
 description: >
-  Adds native Telegram Guest Mode support by subclassing the bundled
-  Telegram adapter. Normal Telegram traffic always uses the upstream paths.
+  Adds native Telegram Guest Mode support through Hermes' platform-handler
+  API and a thin delivery adapter. Normal Telegram traffic stays upstream.
 author: Aster + Roz

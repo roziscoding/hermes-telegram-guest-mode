@@ -4,7 +4,7 @@ Native [Telegram Guest Bot](https://core.telegram.org/bots/features#guest-bots) 
 
 Guest Mode lets someone mention your bot in a Telegram chat where the bot is **not a member**. Telegram sends the bot limited context and allows one response. This plugin adds that update and response path while delegating ordinary Telegram traffic to Hermes' bundled adapter.
 
-> **Compatibility:** verified with Hermes `v0.20.0` and `python-telegram-bot 22.6`. The plugin subclasses private Telegram adapter methods, so a future Hermes update may require a compatibility fix.
+> **Compatibility:** requires Hermes `v0.20.6` or newer with `ctx.register_platform_handler`, and is verified with `python-telegram-bot 22.8`. The plugin still uses selected private Telegram delivery/enrichment helpers, so a future Hermes update may require a compatibility fix.
 
 ## Install with Hermes
 
@@ -42,10 +42,10 @@ hermes gateway restart
 
 ## How it works
 
-The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` platform:
+The plugin uses Hermes' native `ctx.register_platform_handler("telegram", ...)` extension point to install the Guest update handler before core Telegram handlers. A thin `GuestTelegramAdapter` remains registered only to route synthetic Guest replies through `answerGuestQuery`/inline-message edits while ordinary traffic delegates upstream:
 
-- requests the `guest_message` update type;
-- installs a handler before Telegram polling starts;
+- requires PTB 22.8's native `guest_message` update type and refuses to wire on older PTB builds;
+- installs a scoped handler through the public platform-handler API before core handlers, without mutating PTB's process-global update registry;
 - accepts text or captions plus Hermes-supported direct and replied-to content through a registry-based dispatcher: photos, videos, audio, voice notes, documents, locations/venues, and stickers;
 - preserves quoted voice notes as `VOICE` events so Hermes sends them through automatic speech-to-text;
 - preserves Hermes' normal inbound message pipeline;
@@ -61,7 +61,7 @@ The plugin registers a thin `GuestTelegramAdapter` subclass as the `telegram` pl
 - delegates normal sends, edits, typing indicators, and ordinary updates to the bundled adapter;
 - authorizes the Guest caller through Hermes' user-level Telegram policy, including adapter allowlists, environment allowlists, pairing, and global policy.
 
-If the guest handler cannot be installed, ordinary Telegram startup continues. A normal adapter incompatibility can still prevent this subclass from loading; verify the gateway after every Hermes update.
+Handler-factory failures are isolated by Hermes, so ordinary Telegram startup continues. The adapter also keeps a narrow rebuild fallback for Hermes versions affected by [NousResearch/hermes-agent#96627](https://github.com/NousResearch/hermes-agent/pull/96627); registration is idempotent when the core fix is present. A normal adapter incompatibility can still prevent this subclass from loading, so verify the gateway after every Hermes update.
 
 ## Current limitations
 
