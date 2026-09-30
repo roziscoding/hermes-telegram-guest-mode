@@ -1065,6 +1065,54 @@ def test_guest_authorization_uses_gateway_pairing_policy(adapter):
     assert calls == [("42", "dm", "42")]
 
 
+def test_guest_group_allowlist_authorizes_any_user_in_host_group(adapter):
+    calls = []
+    adapter.config = SimpleNamespace(
+        extra={"guest_group_allow_from": ["-1009999999999"]},
+        home_channel=None,
+    )
+    adapter._authorization_check = lambda *args: calls.append(args) or False
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        chat=SimpleNamespace(id=-1009999999999, type="supergroup"),
+    )
+
+    assert adapter._guest_caller_authorized(message) is True
+    assert calls == []
+
+
+def test_guest_group_allowlist_does_not_bypass_user_policy_in_private_chat(adapter):
+    calls = []
+    adapter.config = SimpleNamespace(
+        extra={"guest_group_allow_from": ["*"]},
+        home_channel=None,
+    )
+    adapter._authorization_check = lambda *args: calls.append(args) or False
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        chat=SimpleNamespace(id=42, type="private"),
+    )
+
+    assert adapter._guest_caller_authorized(message) is False
+    assert calls == [("42", "dm", "42")]
+
+
+def test_nonmatching_guest_group_falls_back_to_user_policy(adapter):
+    calls = []
+    adapter.config = SimpleNamespace(
+        extra={"guest_group_allow_from": ["-1009999999999"]},
+        home_channel=None,
+    )
+    adapter._authorization_check = lambda *args: calls.append(args) or True
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        chat=SimpleNamespace(id=-1001111111111, type="group"),
+    )
+
+    assert adapter._guest_caller_authorized(message) is True
+    assert calls == [("42", "dm", "42")]
+
+
 def test_guest_authorization_prefers_sender_chat_over_telegram_fake_user(adapter):
     adapter.config = SimpleNamespace(
         extra={"group_allow_from": ["-1002069097091"]},

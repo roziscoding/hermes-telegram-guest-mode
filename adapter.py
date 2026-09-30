@@ -144,6 +144,17 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         return cls._configured_guest_ids(config, "allow_from")
 
     def _guest_caller_authorized(self, message: Message) -> bool:
+        extra = getattr(self.config, "extra", {}) or {}
+        chat = getattr(message, "chat", None)
+        host_chat_id = str(getattr(chat, "id", "") or "").strip()
+        host_chat_type = str(getattr(chat, "type", "") or "").strip().lower()
+        if host_chat_id and host_chat_type in {"group", "supergroup"}:
+            allowed_groups = self._configured_guest_ids(
+                self.config, "guest_group_allow_from"
+            )
+            if host_chat_id in allowed_groups or "*" in allowed_groups:
+                return True
+
         sender_chat = getattr(message, "sender_chat", None)
         sender_chat_id = str(getattr(sender_chat, "id", "") or "").strip()
         user = getattr(message, "from_user", None)
@@ -152,8 +163,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         if sender_chat_id:
             caller_id = sender_chat_id
             chat_type = "group"
-            chat = getattr(message, "chat", None)
-            chat_id = str(getattr(chat, "id", "") or caller_id).strip()
+            chat_id = host_chat_id or caller_id
             allowlist_key = "group_allow_from"
         elif user_id:
             caller_id = user_id
@@ -167,7 +177,6 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         # carry Telegram's fake Channel_Bot in from_user, so authorize the real
         # sender_chat against group_allow_from when configured; otherwise fall
         # back to the global allow_from list shared by every Telegram sender.
-        extra = getattr(self.config, "extra", {}) or {}
         configured_key = allowlist_key
         if sender_chat_id and extra.get("group_allow_from") is None:
             configured_key = "allow_from"

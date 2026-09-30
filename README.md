@@ -33,6 +33,27 @@ Then enable Guest Mode in Telegram:
 3. Open **Bot Settings → Guest Mode** and enable it.
 4. Mention the bot from a group or private conversation where it is not a member.
 
+### Authorize an entire host group
+
+By default, Guest Mode authorizes the person or channel profile that invoked the
+bot. To let anyone invoke it from a specific group or supergroup, allowlist the
+host chat ID:
+
+```bash
+hermes config set --force platforms.telegram.extra.guest_group_allow_from '["-1001234567890"]'
+hermes gateway restart
+```
+
+`guest_group_allow_from` accepts a list of Telegram group IDs, or `"*"` to trust
+every group. It never bypasses user authorization in private chats. A Guest
+message from a group not in this list continues through the existing user or
+channel-profile policy.
+
+This setting is intentionally separate from `group_allow_from`: that existing
+key authorizes a channel profile used as the sender (`sender_chat`), while
+`guest_group_allow_from` authorizes the group in which the Guest mention occurs
+(`message.chat.id`).
+
 ## Updating
 
 ```bash
@@ -49,6 +70,7 @@ The plugin uses Hermes' native `ctx.register_platform_handler("telegram", ...)` 
 - accepts text or captions plus Hermes-supported direct and replied-to content through a registry-based dispatcher: photos, videos, audio, voice notes, documents, locations/venues, and stickers;
 - preserves quoted voice notes as `VOICE` events so Hermes sends them through automatic speech-to-text;
 - preserves Hermes' normal inbound message pipeline;
+- optionally authorizes every caller in selected host groups through `guest_group_allow_from`, while leaving private chats and nonmatching groups on the existing caller policy;
 - authorizes channel-profile invocations through `sender_chat` instead of Telegram's fake `Channel_Bot` user, using an explicit `group_allow_from` override when present and the global `allow_from` list otherwise;
 - immediately publishes `✨ Thinking` after authorization using Telegram custom emoji `5463297803235113601`, then replaces it in place as soon as the first streamed token arrives;
 - sends the first visible frame with `answerGuestQuery`, preserves the returned
@@ -98,7 +120,7 @@ hermes gateway restart
 If guest mentions are ignored but normal Telegram works:
 
 - confirm Guest Mode is enabled in BotFather;
-- confirm the person mentioning the bot is authorized in the Hermes Telegram configuration;
+- confirm the person mentioning the bot is authorized in the Hermes Telegram configuration, or that the host group is listed in `guest_group_allow_from`;
 - confirm the logs contain `polling accepts guest_message` after startup.
 
 ## Uninstall
