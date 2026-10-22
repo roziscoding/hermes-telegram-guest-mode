@@ -962,6 +962,9 @@ def test_register_uses_native_platform_handler_extension():
     assert platform == "telegram"
     assert callable(factory)
     ctx.register_platform.assert_called_once()
+    platform_kwargs = ctx.register_platform.call_args.kwargs
+    assert platform_kwargs["env_overrides"]
+    assert platform_kwargs["env_enable_credentials"] == ("TELEGRAM_BOT_TOKEN",)
 
 
 def test_native_factory_does_not_mutate_ptb_update_types(adapter):
