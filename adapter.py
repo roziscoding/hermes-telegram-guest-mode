@@ -300,27 +300,18 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             reply_to_is_own_message=bool(indexed.get("is_own", False)),
             auto_skill=skill,
             channel_prompt=channel_prompt,
-            metadata={
-                "telegram_reaction": {
-                    "added": added,
-                    "removed": removed,
-                    "current": current,
-                    "target_message_id": target_id,
-                }
-            },
             **event_kwargs,
         )
         await self.handle_message(event)
 
     async def handle_message(self, event) -> None:
         """Index normal inbound messages before handing them to Hermes."""
-        metadata = getattr(event, "metadata", None) or {}
         source = getattr(event, "source", None)
         if (
             source is not None
             and event.message_id
             and not is_guest_chat_id(source.chat_id)
-            and "telegram_reaction" not in metadata
+            and not str(event.message_id).startswith("reaction:")
         ):
             try:
                 await reaction_context.record_async(
@@ -332,6 +323,25 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
                     topic=source.chat_topic,
                     skill=event.auto_skill,
                 )
+                if event.reply_to_message_id and event.reply_to_text:
+                    reply_is_own = bool(event.reply_to_is_own_message)
+                    replied = getattr(getattr(event, "raw_message", None), "reply_to_message", None)
+                    reply_author = getattr(replied, "from_user", None)
+                    try:
+                        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+                    except RuntimeError:
+                        bot_id = None
+                    if bot_id is not None and getattr(reply_author, "id", None) is not None:
+                        reply_is_own = str(reply_author.id) == str(bot_id)
+                    await reaction_context.record_if_absent_async(
+                        source.chat_id,
+                        event.reply_to_message_id,
+                        event.reply_to_text,
+                        thread_id=source.thread_id,
+                        is_own=reply_is_own,
+                        topic=source.chat_topic,
+                        skill=event.auto_skill,
+                    )
             except Exception:
                 logger.debug(
                     "[Telegram Reactions] Could not index inbound message in chat %s",

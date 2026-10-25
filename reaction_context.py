@@ -109,6 +109,60 @@ async def record_async(*args: Any, **kwargs: Any) -> None:
     await asyncio.to_thread(record, *args, **kwargs)
 
 
+def record_if_absent(
+    chat_id: object,
+    message_id: object,
+    text: str | None,
+    *,
+    thread_id: object = None,
+    is_own: bool = False,
+    topic: str | None = None,
+    skill: str | None = None,
+) -> None:
+    """Insert reply-derived context without replacing a more authoritative snapshot."""
+    if chat_id is None or message_id is None or not text:
+        return
+    with _LOCK:
+        try:
+            with _connect(_store_path()) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO message_context (
+                        chat_id, message_id, text, thread_id, is_own, topic, skill, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, message_id) DO NOTHING
+                    """,
+                    (
+                        str(chat_id),
+                        str(message_id),
+                        str(text)[:_MAX_TEXT_CHARS],
+                        str(thread_id) if thread_id is not None and str(thread_id) else None,
+                        int(bool(is_own)),
+                        str(topic) if topic else None,
+                        str(skill) if skill else None,
+                        int(time.time()),
+                    ),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM message_context
+                    WHERE rowid IN (
+                        SELECT rowid FROM message_context
+                        ORDER BY updated_at ASC
+                        LIMIT MAX((SELECT COUNT(*) FROM message_context) - ?, 0)
+                    )
+                    """,
+                    (_MAX_ENTRIES,),
+                )
+        except (OSError, sqlite3.Error):
+            return
+
+
+async def record_if_absent_async(*args: Any, **kwargs: Any) -> None:
+    """Run the insert-if-absent operation away from the gateway event loop."""
+    await asyncio.to_thread(record_if_absent, *args, **kwargs)
+
+
 def lookup(chat_id: object, message_id: object) -> dict[str, Any] | None:
     """Return one indexed message, or ``None`` when it is unknown."""
     if chat_id is None or message_id is None:

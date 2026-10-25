@@ -17,6 +17,7 @@ for path in (PLUGIN_DIR,):
         sys.path.insert(0, str(path))
 
 from gateway.platforms.base import SendResult
+from gateway.session_envelope import _native_metadata
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram import adapter as telegram_base
 
@@ -138,7 +139,8 @@ async def test_reaction_becomes_agent_turn_with_exact_message_and_topic(reaction
     assert event.auto_skill == "securo"
     assert event.message_id == "reaction:77"
     assert event.platform_update_id == 77
-    assert event.metadata["telegram_reaction"]["current"] == ["👍"]
+    assert event.metadata == {}
+    assert _native_metadata(event) == {}
 
 
 @pytest.mark.asyncio
@@ -159,7 +161,7 @@ async def test_reaction_removal_is_forwarded_without_implying_undo(reaction_adap
 
     assert len(captured) == 1
     assert captured[0].text == "reaction:removed:👍"
-    assert captured[0].metadata["telegram_reaction"]["current"] == []
+    assert captured[0].metadata == {}
 
 
 @pytest.mark.asyncio
@@ -273,7 +275,6 @@ async def test_synthetic_reaction_turn_accepts_telegram_update_claim(reaction_ad
             chat_id="16715013", chat_type="dm", user_id="42", thread_id="2446110",
         ),
         message_id="reaction:77",
-        metadata={"telegram_reaction": {"added": ["👍"]}},
     )
     monkeypatch.setattr(telegram_base, "apply_root_dm_topic_transfer", AsyncMock())
     parent_handle = AsyncMock()
@@ -283,6 +284,72 @@ async def test_synthetic_reaction_turn_accepts_telegram_update_claim(reaction_ad
 
     assert claim.accepted is True
     parent_handle.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_reply_backfills_reaction_context_for_pre_activation_message(
+    reaction_adapter, monkeypatch,
+):
+    reaction_adapter._bot = SimpleNamespace(id=777)
+    event = telegram_base.MessageEvent(
+        text="Reagi com joinha",
+        source=reaction_adapter.build_source(
+            chat_id="16715013",
+            chat_type="dm",
+            user_id="42",
+            thread_id="2446110",
+            chat_topic="Securo",
+        ),
+        message_id="3941",
+        reply_to_message_id="3934",
+        reply_to_text="Preview preparado no Securo",
+        raw_message=SimpleNamespace(
+            reply_to_message=SimpleNamespace(from_user=SimpleNamespace(id=777)),
+        ),
+        auto_skill="securo",
+    )
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "handle_message", AsyncMock())
+
+    await GuestTelegramAdapter.handle_message(reaction_adapter, event)
+
+    indexed = reaction_context.lookup("16715013", "3934")
+    assert indexed is not None
+    assert indexed["text"] == "Preview preparado no Securo"
+    assert indexed["thread_id"] == "2446110"
+    assert indexed["is_own"] is True
+    assert indexed["topic"] == "Securo"
+    assert indexed["skill"] == "securo"
+
+
+def test_reply_backfill_does_not_overwrite_existing_reaction_context():
+    reaction_context.record(
+        "16715013",
+        "3934",
+        "Preview completo",
+        thread_id="topic-A",
+        is_own=True,
+        topic="Securo",
+        skill="securo",
+    )
+
+    reaction_context.record_if_absent(
+        "16715013",
+        "3934",
+        "Trecho parcial",
+        thread_id="topic-B",
+        is_own=False,
+        topic="Outro",
+        skill="homelab",
+    )
+
+    assert reaction_context.lookup("16715013", "3934") == {
+        "text": "Preview completo",
+        "thread_id": "topic-A",
+        "is_own": True,
+        "topic": "Securo",
+        "skill": "securo",
+        "ts": reaction_context.lookup("16715013", "3934")["ts"],
+    }
 
 
 @pytest.mark.asyncio

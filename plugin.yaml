@@ -1,7 +1,7 @@
 name: telegram-guest
 label: Telegram Guest Mode
 kind: standalone
-version: 1.2.0
+version: 1.2.1
 description: >
   Adds native Telegram Guest Mode plus contextual reaction-triggered turns
   through a thin extension of Hermes' bundled Telegram adapter.
