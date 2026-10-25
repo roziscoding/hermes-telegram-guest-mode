@@ -20,6 +20,11 @@ from telegram import (
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop, TypeHandler
 
+if __package__:
+    from . import reaction_context
+else:
+    import reaction_context
+
 GUEST_UPDATE_TYPE = "guest_message"
 GUEST_CHAT_PREFIX = "guest:"
 GUEST_THINKING_TEXT = "✨ Thinking"
@@ -78,6 +83,7 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         self._guest_queries: dict[str, GuestQueryState] = {}
         self._answer_attempted_query_ids: dict[str, float] = {}
         self._guest_handler_apps: set[int] = set()
+        self._reaction_handler_apps: set[int] = set()
 
     def _remember_guest_query(self, chat_id: str, query_id: str) -> GuestQueryState:
         now = time.monotonic()
@@ -122,10 +128,217 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         installed.add(app_id)
         return True
 
+    def _ensure_reaction_handler(self, app) -> bool:
+        """Install the reaction-to-agent bridge once on each PTB application."""
+        if "message_reaction" not in Update.ALL_TYPES:
+            logger.error(
+                "[Telegram Reactions] python-telegram-bot lacks message_reaction support"
+            )
+            return False
+        installed = getattr(self, "_reaction_handler_apps", None)
+        if installed is None:
+            installed = self._reaction_handler_apps = set()
+        app_id = id(app)
+        if app_id in installed:
+            return True
+        try:
+            # Runs before normal message handlers, while the bundled group-99 observer
+            # remains free to publish the same update to gateway_platform_event hooks.
+            app.add_handler(TypeHandler(Update, self._handle_reaction_update), group=-90)
+        except Exception:
+            logger.warning(
+                "[Telegram Reactions] Could not install reaction handler",
+                exc_info=True,
+            )
+            return False
+        installed.add(app_id)
+        return True
+
     def _register_handlers(self, app) -> None:
-        """Keep Guest wiring on PTB applications rebuilt by older Hermes cores."""
+        """Keep Guest and reaction wiring on every rebuilt PTB application."""
         self._ensure_guest_handler(app)
+        self._ensure_reaction_handler(app)
         super()._register_handlers(app)
+
+    @staticmethod
+    def _reaction_tokens(items: Any) -> list[str]:
+        tokens: list[str] = []
+        for item in (items or ()):
+            emoji = getattr(item, "emoji", None)
+            custom_id = getattr(item, "custom_emoji_id", None)
+            token = str(emoji) if emoji else (f"custom_emoji:{custom_id}" if custom_id else "")
+            if token and token not in tokens:
+                tokens.append(token)
+        return tokens
+
+    @staticmethod
+    def _reaction_event_text(added: list[str], removed: list[str], current: list[str]) -> str:
+        if len(added) == 1 and not removed:
+            return f"reaction:added:{added[0]}"
+        if len(removed) == 1 and not added:
+            return f"reaction:removed:{removed[0]}"
+        added_text = ",".join(added) or "none"
+        removed_text = ",".join(removed) or "none"
+        current_text = ",".join(current) or "none"
+        return f"reaction:updated:added={added_text};removed={removed_text};current={current_text}"
+
+    def _topic_context(self, chat_id: str, chat_type: str, thread_id: str | None) -> tuple[str | None, str | None]:
+        if not thread_id:
+            return None, None
+        if chat_type == "dm":
+            info = self._get_dm_topic_info(chat_id, thread_id)
+            if info:
+                return info.get("name"), info.get("skill")
+            return None, None
+        group_topics = (getattr(self.config, "extra", {}) or {}).get("group_topics", [])
+        if isinstance(group_topics, dict):
+            group_topics = [
+                {"chat_id": configured_chat_id, "topics": topics}
+                for configured_chat_id, topics in group_topics.items()
+            ]
+        for entry in group_topics if isinstance(group_topics, list) else ():
+            if not isinstance(entry, dict) or str(entry.get("chat_id", "")) != chat_id:
+                continue
+            for topic in entry.get("topics", ()):
+                if isinstance(topic, dict) and str(topic.get("thread_id", "")) == thread_id:
+                    return topic.get("name"), topic.get("skill")
+        return None, None
+
+    async def _handle_reaction_update(self, update: Update, context: Any) -> None:
+        """Turn every authorized reaction change into a contextual agent message."""
+        reaction = getattr(update, "message_reaction", None)
+        if reaction is None:
+            return
+        old = self._reaction_tokens(getattr(reaction, "old_reaction", None))
+        current = self._reaction_tokens(getattr(reaction, "new_reaction", None))
+        added = [token for token in current if token not in old]
+        removed = [token for token in old if token not in current]
+        if not added and not removed:
+            return
+
+        chat = getattr(reaction, "chat", None)
+        actor = getattr(reaction, "user", None) or getattr(reaction, "actor_chat", None)
+        chat_id = str(getattr(chat, "id", "")).strip()
+        actor_id = str(getattr(actor, "id", "")).strip()
+        target_id = str(getattr(reaction, "message_id", "")).strip()
+        if not chat_id or not actor_id or not target_id:
+            logger.debug("[Telegram Reactions] Dropping update without chat, actor, or target")
+            return
+
+        try:
+            indexed = await reaction_context.lookup_async(chat_id, target_id) or {}
+        except Exception:
+            indexed = {}
+            logger.debug(
+                "[Telegram Reactions] Context lookup failed for chat %s message %s",
+                chat_id,
+                target_id,
+                exc_info=True,
+            )
+        thread_id = str(indexed.get("thread_id") or "").strip() or None
+        auth_source = self._source_from_reaction_for_auth(update)
+        # The auth extractor uses "forum" to apply forum-specific policy, while
+        # ordinary Telegram messages route supergroups as "group". Preserve that
+        # split so the reaction lands in the existing topic session.
+        routing_chat_type = "group" if auth_source.chat_type == "forum" else auth_source.chat_type
+        is_bot = bool(getattr(actor, "is_bot", False))
+        authorized = self._is_sender_authorized(
+            actor_id,
+            auth_source.chat_type,
+            chat_id,
+            is_bot=is_bot,
+            thread_id=thread_id,
+        )
+        if authorized is not True:
+            logger.info(
+                "[Telegram Reactions] Ignoring reaction from unauthorized actor %s in chat %s",
+                actor_id,
+                chat_id,
+            )
+            return
+        topic, skill = self._topic_context(chat_id, routing_chat_type, thread_id)
+        topic = indexed.get("topic") or topic
+        skill = indexed.get("skill") or skill
+        update_id = getattr(update, "update_id", None)
+        synthetic_id = f"reaction:{update_id}" if update_id is not None else f"reaction:{target_id}:{','.join(current)}"
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=getattr(chat, "title", None) or getattr(chat, "full_name", None),
+            chat_type=routing_chat_type,
+            user_id=actor_id,
+            user_name=(
+                getattr(actor, "username", None)
+                or getattr(actor, "full_name", None)
+                or getattr(actor, "title", None)
+            ),
+            thread_id=thread_id,
+            chat_topic=topic,
+            message_id=synthetic_id,
+            is_bot=is_bot,
+        )
+        from gateway.platforms.base import resolve_channel_prompt
+
+        extra = getattr(self.config, "extra", {}) or {}
+        channel_prompt = resolve_channel_prompt(
+            extra,
+            thread_id or chat_id,
+            chat_id if thread_id else None,
+        )
+        event_kwargs: dict[str, Any] = {}
+        event_date = getattr(reaction, "date", None)
+        if event_date is not None:
+            event_kwargs["timestamp"] = event_date
+        event = telegram_base.MessageEvent(
+            text=self._reaction_event_text(added, removed, current),
+            message_type=telegram_base.MessageType.TEXT,
+            source=source,
+            raw_message=update,
+            message_id=synthetic_id,
+            platform_update_id=update_id,
+            reply_to_message_id=target_id,
+            reply_to_text=indexed.get("text"),
+            reply_to_is_own_message=bool(indexed.get("is_own", False)),
+            auto_skill=skill,
+            channel_prompt=channel_prompt,
+            metadata={
+                "telegram_reaction": {
+                    "added": added,
+                    "removed": removed,
+                    "current": current,
+                    "target_message_id": target_id,
+                }
+            },
+            **event_kwargs,
+        )
+        await self.handle_message(event)
+
+    async def handle_message(self, event) -> None:
+        """Index normal inbound messages before handing them to Hermes."""
+        metadata = getattr(event, "metadata", None) or {}
+        source = getattr(event, "source", None)
+        if (
+            source is not None
+            and event.message_id
+            and not is_guest_chat_id(source.chat_id)
+            and "telegram_reaction" not in metadata
+        ):
+            try:
+                await reaction_context.record_async(
+                    source.chat_id,
+                    event.message_id,
+                    event.text,
+                    thread_id=source.thread_id,
+                    is_own=False,
+                    topic=source.chat_topic,
+                    skill=event.auto_skill,
+                )
+            except Exception:
+                logger.debug(
+                    "[Telegram Reactions] Could not index inbound message in chat %s",
+                    source.chat_id,
+                    exc_info=True,
+                )
+        await super().handle_message(event)
 
     @staticmethod
     def _configured_guest_ids(config, key: str) -> set[str]:
@@ -677,6 +890,57 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
             return self.GUEST_STREAM_CONSUMER_LIMIT
         return super().max_message_length_for_chat(chat_id)
 
+    @staticmethod
+    def _delivery_message_ids(result: SendResult, fallback: str | None = None) -> list[str]:
+        ids: list[str] = []
+
+        def add(value: Any) -> None:
+            if value is not None and str(value) and str(value) not in ids:
+                ids.append(str(value))
+
+        add(fallback)
+        add(getattr(result, "message_id", None))
+        for value in getattr(result, "continuation_message_ids", ()) or ():
+            add(value)
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        for key in ("message_ids", "continuation_message_ids", "delivered_message_ids"):
+            for value in raw.get(key, ()) or ():
+                add(value)
+        return ids
+
+    async def _record_outbound_result(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+        result: SendResult,
+        *,
+        fallback_id: str | None = None,
+    ) -> None:
+        if not result.success:
+            return
+        try:
+            thread_id = self._metadata_thread_id(metadata)
+            topic, skill = self._topic_context(str(chat_id), "dm", thread_id)
+            if topic is None and thread_id:
+                topic, skill = self._topic_context(str(chat_id), "group", thread_id)
+            for message_id in self._delivery_message_ids(result, fallback_id):
+                await reaction_context.record_async(
+                    chat_id,
+                    message_id,
+                    content,
+                    thread_id=thread_id,
+                    is_own=True,
+                    topic=topic,
+                    skill=skill,
+                )
+        except Exception:
+            logger.debug(
+                "[Telegram Reactions] Could not index delivered message in chat %s",
+                chat_id,
+                exc_info=True,
+            )
+
     async def send(
         self,
         chat_id: str,
@@ -685,7 +949,9 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not is_guest_chat_id(chat_id):
-            return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            await self._record_outbound_result(chat_id, content, metadata, result)
+            return result
 
         state = self._guest_queries.get(str(chat_id))
         if state is None:
@@ -733,13 +999,22 @@ class GuestTelegramAdapter(telegram_base.TelegramAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         if not is_guest_chat_id(chat_id):
-            return await super().edit_message(
+            result = await super().edit_message(
                 chat_id,
                 message_id,
                 content,
                 finalize=finalize,
                 metadata=metadata,
             )
+            if finalize:
+                await self._record_outbound_result(
+                    chat_id,
+                    content,
+                    metadata,
+                    result,
+                    fallback_id=message_id,
+                )
+            return result
 
         state = self._guest_queries.get(str(chat_id))
         if state is None:

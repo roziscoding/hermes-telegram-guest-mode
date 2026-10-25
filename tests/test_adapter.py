@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,6 +20,7 @@ from gateway.platforms.base import SendResult
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from plugins.platforms.telegram import adapter as telegram_base
 
+import reaction_context
 from adapter import (
     GuestEditError,
     GuestTelegramAdapter,
@@ -49,6 +51,314 @@ def test_guest_chat_ids_are_namespaced_and_round_trip():
     assert chat_id == "guest:query-123"
     assert is_guest_chat_id(chat_id)
     assert not is_guest_chat_id("16715013")
+
+
+@pytest.fixture(autouse=True)
+def isolated_reaction_context(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        reaction_context,
+        "_store_path",
+        lambda: str(tmp_path / "telegram-reaction-context.sqlite3"),
+    )
+
+
+@pytest.fixture
+def reaction_adapter():
+    instance = object.__new__(GuestTelegramAdapter)
+    instance.config = SimpleNamespace(extra={
+        "dm_topics": [{
+            "chat_id": "16715013",
+            "topics": [{"name": "Securo", "thread_id": "2446110", "skill": "securo"}],
+        }]
+    })
+    instance._reaction_handler_apps = set()
+    instance._dm_topics = {"16715013:Securo": 2446110}
+    instance._dm_topics_config = instance.config.extra["dm_topics"]
+    instance.platform = telegram_base.Platform.TELEGRAM
+    instance.gateway_runner = None
+    instance._guest_queries = {}
+    instance._answer_attempted_query_ids = {}
+    instance._status_message_ids = {}
+    instance._message_handler = AsyncMock()
+    instance._authorization_check = lambda *args, **kwargs: True
+    instance._topic_recovery_fn = None
+    instance._active_sessions = {}
+    instance._pending_messages = {}
+    instance._session_tasks = {}
+    return instance
+
+
+def _reaction_update(
+    *, update_id=77, old=(), new=("👍",), message_id=9001,
+    chat_id=16715013, chat_type="private", is_forum=False,
+):
+    def _reaction(emoji):
+        return SimpleNamespace(emoji=emoji, custom_emoji_id=None)
+
+    return SimpleNamespace(
+        update_id=update_id,
+        message_reaction=SimpleNamespace(
+            chat=SimpleNamespace(
+                id=chat_id, type=chat_type, title=None, full_name="Roz", is_forum=is_forum,
+            ),
+            user=SimpleNamespace(id=42, username="roz", full_name="Roz", is_bot=False),
+            actor_chat=None,
+            message_id=message_id,
+            old_reaction=[_reaction(emoji) for emoji in old],
+            new_reaction=[_reaction(emoji) for emoji in new],
+            date=None,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaction_becomes_agent_turn_with_exact_message_and_topic(reaction_adapter):
+    reaction_context.record(
+        "16715013", "9001", "Propostas: A e B", thread_id="2446110",
+        is_own=True, topic="Securo", skill="securo",
+    )
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    reaction_adapter.handle_message = capture
+
+    await reaction_adapter._handle_reaction_update(_reaction_update(), None)
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.text == "reaction:added:👍"
+    assert event.reply_to_message_id == "9001"
+    assert event.reply_to_text == "Propostas: A e B"
+    assert event.reply_to_is_own_message is True
+    assert event.source.chat_id == "16715013"
+    assert event.source.thread_id == "2446110"
+    assert event.source.user_id == "42"
+    assert event.auto_skill == "securo"
+    assert event.message_id == "reaction:77"
+    assert event.platform_update_id == 77
+    assert event.metadata["telegram_reaction"]["current"] == ["👍"]
+
+
+@pytest.mark.asyncio
+async def test_reaction_removal_is_forwarded_without_implying_undo(reaction_adapter):
+    reaction_context.record(
+        "16715013", "9001", "Uma proposta", thread_id="2446110", is_own=True,
+    )
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    reaction_adapter.handle_message = capture
+
+    await reaction_adapter._handle_reaction_update(
+        _reaction_update(update_id=78, old=("👍",), new=()), None,
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "reaction:removed:👍"
+    assert captured[0].metadata["telegram_reaction"]["current"] == []
+
+
+@pytest.mark.asyncio
+async def test_reaction_without_index_still_reaches_agent(reaction_adapter):
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    reaction_adapter.handle_message = capture
+
+    await reaction_adapter._handle_reaction_update(
+        _reaction_update(update_id=79, message_id=9999, new=("🔥",)), None,
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "reaction:added:🔥"
+    assert captured[0].reply_to_message_id == "9999"
+    assert captured[0].reply_to_text is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_store_lookup_failure_still_reaches_agent(reaction_adapter, monkeypatch):
+    monkeypatch.setattr(
+        reaction_context,
+        "lookup_async",
+        AsyncMock(side_effect=RuntimeError("store unavailable")),
+    )
+    reaction_adapter.handle_message = AsyncMock()
+
+    await reaction_adapter._handle_reaction_update(_reaction_update(), None)
+
+    reaction_adapter.handle_message.assert_awaited_once()
+    call = reaction_adapter.handle_message.await_args
+    assert call is not None
+    event = call.args[0]
+    assert event.text == "reaction:added:👍"
+    assert event.reply_to_text is None
+
+
+@pytest.mark.asyncio
+async def test_forum_reaction_reuses_ordinary_group_topic_session(reaction_adapter):
+    chat_id = "-100123"
+    thread_id = "77"
+    reaction_adapter.config.extra["group_topics"] = [{
+        "chat_id": chat_id,
+        "topics": [{"thread_id": thread_id, "name": "Ops", "skill": "homelab"}],
+    }]
+    reaction_context.record(
+        chat_id, "9001", "Reiniciar serviço?", thread_id=thread_id, is_own=True,
+    )
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    reaction_adapter.handle_message = capture
+
+    await reaction_adapter._handle_reaction_update(
+        _reaction_update(chat_id=int(chat_id), chat_type="supergroup", is_forum=True), None,
+    )
+
+    assert len(captured) == 1
+    reaction_source = captured[0].source
+    ordinary_source = reaction_adapter.build_source(
+        chat_id=chat_id,
+        chat_type="group",
+        user_id="42",
+        thread_id=thread_id,
+        chat_topic="Ops",
+    )
+    assert reaction_source.chat_type == "group"
+    assert reaction_source.thread_id == thread_id
+    assert captured[0].auto_skill == "homelab"
+    assert reaction_adapter._source_session_key(reaction_source) == reaction_adapter._source_session_key(ordinary_source)
+
+
+@pytest.mark.asyncio
+async def test_reaction_fails_closed_when_actor_is_not_authorized(reaction_adapter):
+    reaction_context.record(
+        "16715013", "9001", "Faça algo sensível", thread_id="2446110", is_own=True,
+    )
+    reaction_adapter._authorization_check = lambda *args, **kwargs: False
+    reaction_adapter.handle_message = AsyncMock()
+
+    await reaction_adapter._handle_reaction_update(_reaction_update(), None)
+
+    reaction_adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaction_fails_closed_without_authorization_callback(reaction_adapter):
+    reaction_adapter._authorization_check = None
+    reaction_adapter.handle_message = AsyncMock()
+
+    await reaction_adapter._handle_reaction_update(_reaction_update(), None)
+
+    reaction_adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_reaction_turn_accepts_telegram_update_claim(reaction_adapter, monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.telegram.update_admission import _Claim
+
+    claim = _Claim("123:77", asyncio.current_task())
+    reaction_adapter._update_admission = ContextVar("reaction_claim", default=claim)
+    event = telegram_base.MessageEvent(
+        text="reaction:added:👍",
+        source=reaction_adapter.build_source(
+            chat_id="16715013", chat_type="dm", user_id="42", thread_id="2446110",
+        ),
+        message_id="reaction:77",
+        metadata={"telegram_reaction": {"added": ["👍"]}},
+    )
+    monkeypatch.setattr(telegram_base, "apply_root_dm_topic_transfer", AsyncMock())
+    parent_handle = AsyncMock()
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", parent_handle)
+
+    await GuestTelegramAdapter.handle_message(reaction_adapter, event)
+
+    assert claim.accepted is True
+    parent_handle.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_guest_events_are_not_written_to_reaction_context(reaction_adapter, monkeypatch):
+    event = telegram_base.MessageEvent(
+        text="guest prompt",
+        source=reaction_adapter.build_source(
+            chat_id="guest:query-1", chat_type="guest", user_id="42",
+        ),
+        message_id="9",
+    )
+    record = AsyncMock()
+    monkeypatch.setattr(reaction_context, "record_async", record)
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "handle_message", AsyncMock())
+
+    await GuestTelegramAdapter.handle_message(reaction_adapter, event)
+
+    record.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inbound_index_failure_does_not_block_normal_ingress(reaction_adapter, monkeypatch):
+    event = telegram_base.MessageEvent(
+        text="normal",
+        source=reaction_adapter.build_source(
+            chat_id="16715013", chat_type="dm", user_id="42", thread_id="2446110",
+        ),
+        message_id="100",
+    )
+    monkeypatch.setattr(
+        reaction_context,
+        "record_async",
+        AsyncMock(side_effect=RuntimeError("store unavailable")),
+    )
+    parent_handle = AsyncMock()
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "handle_message", parent_handle)
+
+    await GuestTelegramAdapter.handle_message(reaction_adapter, event)
+
+    parent_handle.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_outbound_send_is_persisted_for_future_reaction(reaction_adapter, monkeypatch):
+    result = SendResult(
+        success=True,
+        message_id="101",
+        raw_response={"message_ids": ["101", "102"]},
+    )
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "send", AsyncMock(return_value=result))
+
+    await reaction_adapter.send(
+        "16715013", "Relatório completo", metadata={"thread_id": "2446110"},
+    )
+
+    first = reaction_context.lookup("16715013", "101")
+    second = reaction_context.lookup("16715013", "102")
+    assert first["text"] == "Relatório completo"
+    assert second["text"] == "Relatório completo"
+    assert first["thread_id"] == "2446110"
+    assert first["is_own"] is True
+
+
+@pytest.mark.asyncio
+async def test_outbound_index_failure_does_not_change_successful_delivery(reaction_adapter, monkeypatch):
+    expected = SendResult(success=True, message_id="101")
+    monkeypatch.setattr(telegram_base.TelegramAdapter, "send", AsyncMock(return_value=expected))
+    monkeypatch.setattr(
+        reaction_context,
+        "record_async",
+        AsyncMock(side_effect=RuntimeError("store unavailable")),
+    )
+
+    result = await reaction_adapter.send("16715013", "Entregue")
+
+    assert result is expected
 
 
 @pytest.mark.asyncio
@@ -1195,16 +1505,17 @@ def test_native_factory_owns_initial_guest_handler_registration(adapter):
     assert calls[0][1]["group"] == -100
 
 
-def test_core_handler_rebuild_restores_guest_handler(adapter, monkeypatch):
+def test_core_handler_rebuild_restores_guest_and_reaction_handlers(adapter, monkeypatch):
     app = MagicMock()
     adapter._guest_handler_apps = set()
+    adapter._reaction_handler_apps = set()
     core_register = MagicMock()
     monkeypatch.setattr(telegram_base.TelegramAdapter, "_register_handlers", core_register)
 
     adapter._register_handlers(app)
 
-    app.add_handler.assert_called_once()
-    assert app.add_handler.call_args.kwargs["group"] == -100
+    assert app.add_handler.call_count == 2
+    assert [call.kwargs["group"] for call in app.add_handler.call_args_list] == [-100, -90]
     core_register.assert_called_once_with(app)
 
 
@@ -1700,12 +2011,12 @@ async def test_normal_status_updates_delegate_to_bundled_adapter(adapter, monkey
 
 
 @pytest.mark.asyncio
-async def test_normal_send_delegates_unchanged_to_bundled_adapter(adapter, monkeypatch):
+async def test_normal_send_delegates_unchanged_to_bundled_adapter(reaction_adapter, monkeypatch):
     expected = SendResult(success=True, message_id="123")
     parent_send = AsyncMock(return_value=expected)
     monkeypatch.setattr(telegram_base.TelegramAdapter, "send", parent_send)
 
-    result = await adapter.send("16715013", "normal", reply_to="8", metadata={"notify": True})
+    result = await reaction_adapter.send("16715013", "normal", reply_to="8", metadata={"notify": True})
 
     assert result is expected
     parent_send.assert_awaited_once_with(

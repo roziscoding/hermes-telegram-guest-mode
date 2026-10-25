@@ -2,7 +2,7 @@
 
 Native [Telegram Guest Bot](https://core.telegram.org/bots/features#guest-bots) support for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-Guest Mode lets someone mention your bot in a Telegram chat where the bot is **not a member**. Telegram sends the bot limited context and allows one response. This plugin adds that update and response path while delegating ordinary Telegram traffic to Hermes' bundled adapter.
+Guest Mode lets someone mention your bot in a Telegram chat where the bot is **not a member**. Telegram sends the bot limited context and allows one response. This plugin adds that update and response path while delegating ordinary Telegram traffic to Hermes' bundled adapter. It also turns Telegram reactions from authorized users into normal agent turns with the reacted-to message and exact topic attached as context.
 
 > **Compatibility:** requires Hermes `v0.20.6` or newer with `ctx.register_platform_handler`, and is verified with `python-telegram-bot 22.8`. The plugin still uses selected private Telegram delivery/enrichment helpers, so a future Hermes update may require a compatibility fix.
 
@@ -83,6 +83,20 @@ The plugin uses Hermes' native `ctx.register_platform_handler("telegram", ...)` 
 - delegates normal sends, edits, typing indicators, and ordinary updates to the bundled adapter;
 - authorizes the Guest caller through Hermes' user-level Telegram policy, including adapter allowlists, environment allowlists, pairing, and global policy.
 
+### Contextual reactions
+
+For ordinary Telegram chats, the same thin adapter:
+
+- receives `message_reaction` updates for every authorized human actor, not only a fixed emoji allowlist;
+- records inbound and outbound message text plus topic routing in a bounded SQLite index, allowing reactions after a gateway restart to retain their context;
+- turns additions, removals, and replacements into normal `MessageEvent` turns such as `reaction:added:👍`;
+- quotes the complete reacted-to message to the agent and routes the turn to the exact DM/forum topic, including the topic's bound skill;
+- leaves the meaning to the agent: one 👍 on a report containing several proposals can confirm the whole report without hard-coding finance or cron behavior in the transport;
+- uses Hermes' profile-scoped Telegram authorization callback and fails closed if authorization is unavailable;
+- relies on Hermes' durable Telegram update-admission receipts for replay protection across reconnects and restarts.
+
+Removing a reaction creates a separate contextual turn; it does not automatically reverse a side effect that was already completed.
+
 Handler-factory failures are isolated by Hermes, so ordinary Telegram startup continues. The adapter also keeps a narrow rebuild fallback for Hermes versions affected by [NousResearch/hermes-agent#96627](https://github.com/NousResearch/hermes-agent/pull/96627); registration is idempotent when the core fix is present. A normal adapter incompatibility can still prevent this subclass from loading, so verify the gateway after every Hermes update.
 
 ## Current limitations
@@ -93,6 +107,7 @@ Handler-factory failures are isolated by Hermes, so ordinary Telegram startup co
 - Initial and legacy Guest text is capped at Telegram's 4,096 UTF-16-unit limit. Eligible streamed responses can upgrade in place to a final rich message up to Telegram's 32,768-character rich limit.
 - Rich final promotion requires a Hermes core whose StreamConsumer knows explicit `is_turn_final`. The plugin safely bridges builds that expose the signal on `_send_or_edit` but drop it before adapter edits; older builds with no signal remain on the conservative MarkdownV2/plain path, and newer cores with native propagation skip the shim.
 - The plugin depends on private Hermes adapter methods and may need updates when Hermes changes them.
+- Telegram's anonymous `message_reaction_count` updates contain no actor identity and therefore cannot pass authorization; they are intentionally not converted into agent turns. Ordinary user reactions use `message_reaction` and are supported.
 
 ## Troubleshooting
 
